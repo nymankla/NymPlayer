@@ -1,6 +1,40 @@
 # NymPlayer
 
+[![CI](https://github.com/nymankla/NymPlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/nymankla/NymPlayer/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/nymankla/NymPlayer)](https://github.com/nymankla/NymPlayer/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A small Windows app that plays live audio from an input device, such as a USB audio interface or line-in, through any output device, such as speakers or Bluetooth headphones.
+
+**[⬇ Download the latest version](https://github.com/nymankla/NymPlayer/releases/latest)**: a single `.exe`, no installer.
+
+## Install
+
+NymPlayer is a single program file. There's no installer and no extra software to install.
+
+1. Open the [latest release](https://github.com/nymankla/NymPlayer/releases/latest) and download `NymPlayer-vX.Y.Z-windows-x64.exe` under **Assets**.
+2. Make a folder for it, for example `%LOCALAPPDATA%\Programs\NymPlayer` (paste that into the File Explorer address bar), and move the file there. Keeping it out of Downloads matters if you use **Start with Windows**, because Windows starts the app from wherever the file is.
+3. Optionally rename it to `NymPlayer.exe`, then right-click it and choose **Show more options → Send to → Desktop (create shortcut)** or **Pin to Start**.
+4. Double-click to run. The first time, Windows SmartScreen may say *"Windows protected your PC"*, because the app isn't code-signed. Click **More info → Run anyway**. Windows remembers this, so it only asks once.
+
+Requires 64-bit Windows 11. Windows 10 should also work but hasn't been tested.
+
+### First use
+
+1. Plug in your USB audio interface (or other input) and turn on your headphones or speakers.
+2. Choose the **Input** and **Output** devices, or leave either on **Windows default**.
+3. Press **Play**. The level meters show audio coming in and going out.
+4. Optional: tick **Start with Windows and keep in the tray** to have NymPlayer start hidden in the system tray when you sign in.
+
+### Update
+
+Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), then replace the `.exe` with the new version. Your settings are kept.
+
+### Uninstall
+
+1. If **Start with Windows** is ticked, untick it first. This removes the autostart entry.
+2. Quit NymPlayer and delete the `.exe`.
+3. To also remove your settings, delete the folder `%APPDATA%\NymPlayer`.
 
 ## Features
 
@@ -15,7 +49,7 @@ A small Windows app that plays live audio from an input device, such as a USB au
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.
 
-## Build and run
+## Build from source
 
 Requires Windows and the [Rust toolchain](https://rustup.rs) (MSVC).
 
