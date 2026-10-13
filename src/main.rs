@@ -1,9 +1,14 @@
 #![windows_subsystem = "windows"]
 
+use cpal::FromSample;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{
+    Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +19,7 @@ const WINDOWS_DEFAULT: &str = "";
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 280.0])
+            .with_inner_size([500.0, 300.0])
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap()),
         ..Default::default()
     };
@@ -57,6 +62,9 @@ fn apply_theme(style: &mut egui::Style) {
         w.corner_radius = r;
     }
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, WOOD);
+    // Slider rail (inactive bg_fill) must stand out from the SURFACE panel it sits on.
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(70, 70, 80);
+    v.slider_trailing_fill = true;
     v.window_corner_radius = r;
     v.menu_corner_radius = r;
     style.visuals = v;
@@ -88,8 +96,9 @@ struct App {
     host: cpal::Host,
     inputs: Vec<String>,
     outputs: Vec<String>,
-    sel_in: String,
-    sel_out: String,
+    settings: Settings,
+    /// Output gain as f32 bits, read by the output callback; 0 when muted.
+    gain: Arc<AtomicU32>,
     playing: bool,
     running: Option<Running>,
     status: String,
@@ -100,13 +109,12 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let (sel_in, sel_out) = load_settings();
         let mut app = Self {
             host: cpal::default_host(),
             inputs: vec![],
             outputs: vec![],
-            sel_in,
-            sel_out,
+            settings: Settings::load(),
+            gain: Arc::default(),
             playing: false,
             running: None,
             status: "Stopped".into(),
@@ -114,8 +122,15 @@ impl App {
             in_level: 0.0,
             out_level: 0.0,
         };
+        app.update_gain();
         app.sync();
         app
+    }
+
+    fn update_gain(&self) {
+        let s = &self.settings;
+        let gain = if s.muted { 0.0 } else { s.volume };
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
     /// Refreshes device lists and (re)starts the streams when the device to use has
@@ -128,8 +143,9 @@ impl App {
             self.running = None;
             return;
         }
-        let inp = pick(self.host.input_devices().ok(), self.host.default_input_device(), &self.sel_in);
-        let out = pick(self.host.output_devices().ok(), self.host.default_output_device(), &self.sel_out);
+        let s = &self.settings;
+        let inp = pick(self.host.input_devices().ok(), self.host.default_input_device(), &s.input);
+        let out = pick(self.host.output_devices().ok(), self.host.default_output_device(), &s.output);
         let want = (inp.as_ref().and_then(name), out.as_ref().and_then(name));
         let stale = match &self.running {
             Some(r) => {
@@ -143,7 +159,7 @@ impl App {
         }
         self.running = None; // release the old devices first
         match (inp, out) {
-            (Some(i), Some(o)) => match start(&i, &o) {
+            (Some(i), Some(o)) => match start(&i, &o, self.gain.clone()) {
                 Ok(r) => {
                     self.status = format!("Playing: {} to {}", r.in_name, r.out_name);
                     self.running = Some(r);
@@ -157,10 +173,16 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    // Runs even while the window is minimized (unlike `ui`), so device switching keeps working.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.last_sync.elapsed() > Duration::from_secs(1) {
             self.sync();
         }
+        let wait = if self.running.is_some() { 33 } else { 1000 };
+        ctx.request_repaint_after(Duration::from_millis(wait));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let (in_peak, out_peak) = match &self.running {
             Some(r) => (take_peak(&r.shared.in_peak), take_peak(&r.shared.out_peak)),
             None => (0.0, 0.0),
@@ -170,6 +192,7 @@ impl eframe::App for App {
         self.out_level = out_peak.max(self.out_level * 0.85);
 
         let mut changed = false;
+        let mut volume_done = false;
         let live = self.running.is_some();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0))
@@ -184,13 +207,29 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 egui::Frame::new().fill(SURFACE).corner_radius(10).inner_margin(12.0).show(ui, |ui| {
                     egui::Grid::new("devices").num_columns(3).spacing([12.0, 10.0]).show(ui, |ui| {
+                        let s = &mut self.settings;
                         ui.label("Input");
-                        changed |= device_combo(ui, "in", &mut self.sel_in, &self.inputs);
+                        changed |= device_combo(ui, "in", &mut s.input, &self.inputs);
                         level_meter(ui, meter(self.in_level));
                         ui.end_row();
                         ui.label("Output");
-                        changed |= device_combo(ui, "out", &mut self.sel_out, &self.outputs);
+                        changed |= device_combo(ui, "out", &mut s.output, &self.outputs);
                         level_meter(ui, meter(self.out_level));
+                        ui.end_row();
+                        ui.label("Volume");
+                        ui.spacing_mut().slider_width = 180.0;
+                        let slider = egui::Slider::new(&mut s.volume, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
+                        let r = ui.add_enabled(!s.muted, slider);
+                        let mute = ui.selectable_label(s.muted, if s.muted { "Muted" } else { "Mute" });
+                        if mute.clicked() {
+                            s.muted = !s.muted;
+                        }
+                        if r.changed() || mute.clicked() {
+                            self.update_gain();
+                        }
+                        // Save once a drag ends rather than on every frame of it.
+                        volume_done = r.drag_stopped() || (r.changed() && !r.dragged()) || mute.clicked();
                         ui.end_row();
                     });
                 });
@@ -223,12 +262,12 @@ impl eframe::App for App {
                 });
             });
 
+        if changed || volume_done {
+            self.settings.save();
+        }
         if changed {
-            save_settings(&self.sel_in, &self.sel_out);
             self.sync();
         }
-        let wait = if self.running.is_some() { 33 } else { 1000 };
-        ui.ctx().request_repaint_after(Duration::from_millis(wait));
     }
 }
 
@@ -299,51 +338,39 @@ fn pick(
     devs.and_then(|mut d| d.find(|d| name(d).as_deref() == Some(sel))).or(default)
 }
 
-fn start(inp: &cpal::Device, out: &cpal::Device) -> Result<Running, String> {
+fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result<Running, String> {
     let e = |e: cpal::Error| e.to_string();
     let icfg = inp.default_input_config().map_err(e)?;
-    // shortcut: WASAPI shared-mode capture is f32 in practice; add conversion if a device says otherwise.
-    if icfg.sample_format() != cpal::SampleFormat::F32 {
-        return Err(format!("unsupported input format {}", icfg.sample_format()));
-    }
     let ich = icfg.channels() as usize;
     let in_rate = icfg.sample_rate();
     let ocfg = out.default_output_config().map_err(e)?;
     let och = ocfg.channels() as usize;
-    let mut resampler = Resampler::new(ich, in_rate as f64 / ocfg.sample_rate() as f64);
+    let target = in_rate as usize * TARGET_MS / 1000;
+    let mut converter = Converter::new(ich, ocfg.sample_rate() as f64 / in_rate as f64, target)?;
 
     let shared = Arc::new(Shared::default());
-    let ms = |n: usize| in_rate as usize * n / 1000 * ich;
-    let prime_len = ms(15);
-    // 60 ms cap: if the input clock runs faster than the output, the newest audio is
-    // dropped once the buffer is full instead of letting latency grow.
-    let (mut prod, mut cons) = HeapRb::<f32>::new(ms(60)).split();
+    // Headroom only: the converter holds the fill near `target`, so this rarely fills up.
+    let (prod, mut cons) = HeapRb::<f32>::new(target * 5 * ich).split();
+
+    use cpal::SampleFormat as F;
+    let (cfg, s) = (icfg.config(), shared.clone());
+    let input = match icfg.sample_format() {
+        F::F32 => build_input::<f32>(inp, cfg, prod, s),
+        F::I16 => build_input::<i16>(inp, cfg, prod, s),
+        F::I32 => build_input::<i32>(inp, cfg, prod, s),
+        F::U16 => build_input::<u16>(inp, cfg, prod, s),
+        f => return Err(format!("unsupported input format {f}")),
+    }
+    .map_err(e)?;
 
     let s = shared.clone();
-    let input = inp
-        .build_input_stream(
-            icfg.config(),
-            move |data: &[f32], _: &_| {
-                s.in_peak.fetch_max(peak(data).to_bits(), Ordering::Relaxed);
-                // Whole frames only, so channels never get shifted.
-                let n = data.len().min(prod.vacant_len() / ich * ich);
-                prod.push_slice(&data[..n]);
-            },
-            fail(shared.clone()),
-            None,
-        )
-        .map_err(e)?;
-
-    let s = shared.clone();
-    let mut primed = false;
     let output = out
         .build_output_stream(
             ocfg.config(),
             move |data: &mut [f32], _: &_| {
-                primed |= cons.occupied_len() >= prime_len;
-                if primed {
-                    primed = resampler.fill(data, och, &mut cons);
-                }
+                converter.fill(data, och, &mut cons);
+                let g = f32::from_bits(gain.load(Ordering::Relaxed));
+                data.iter_mut().for_each(|x| *x *= g);
                 s.out_peak.fetch_max(peak(data).to_bits(), Ordering::Relaxed);
             },
             fail(shared.clone()),
@@ -366,41 +393,118 @@ fn fail(shared: Arc<Shared>) -> impl FnMut(cpal::Error) + Send + 'static {
     move |_| shared.failed.store(true, Ordering::Relaxed)
 }
 
-/// Linear-interpolating resampler and channel mapper, run in the output callback.
-struct Resampler {
-    /// Input frames consumed per output frame (in_rate / out_rate).
-    step: f64,
-    /// Position between `a` (0.0) and `b` (1.0).
-    pos: f64,
-    a: Vec<f32>,
-    b: Vec<f32>,
+/// Input stream for any sample type cpal can convert to f32 (devices that don't capture
+/// in f32), pushing into the ring buffer.
+fn build_input<T: cpal::SizedSample>(
+    dev: &cpal::Device,
+    cfg: cpal::StreamConfig,
+    mut prod: ringbuf::HeapProd<f32>,
+    shared: Arc<Shared>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    f32: cpal::FromSample<T>,
+{
+    let ich = cfg.channels as usize;
+    // Sized for any realistic callback, so the callback never allocates.
+    let mut scratch = Vec::<f32>::with_capacity(1 << 16);
+    let fail = fail(shared.clone());
+    dev.build_input_stream(
+        cfg,
+        move |data: &[T], _: &_| {
+            scratch.clear();
+            scratch.extend(data.iter().map(|&x| f32::from_sample_(x)));
+            shared.in_peak.fetch_max(peak(&scratch).to_bits(), Ordering::Relaxed);
+            // Whole frames only, so channels never get shifted. When full, the newest
+            // audio is dropped.
+            let n = scratch.len().min(prod.vacant_len() / ich * ich);
+            prod.push_slice(&scratch[..n]);
+        },
+        fail,
+        None,
+    )
 }
 
-impl Resampler {
-    fn new(ich: usize, step: f64) -> Self {
-        Self { step, pos: 1.0, a: vec![0.0; ich], b: vec![0.0; ich] }
+/// Buffered input the converter aims to keep: enough to ride out callback jitter.
+const TARGET_MS: usize = 20;
+/// Output frames per resampler chunk. Small, as it adds to latency.
+const CHUNK: usize = 64;
+
+/// The output side of the audio path, run in the output callback:
+/// - pulls input frames from the ring buffer
+/// - resamples to the output rate (sinc interpolation, via rubato)
+/// - nudges that ratio to hold the buffer fill at `target`, so differing input and output
+///   clocks never overflow or drain the buffer
+/// - maps channels: extra output channels repeat the last input channel, so mono feeds
+///   both ears.
+struct Converter {
+    rs: Async<f32>,
+    ich: usize,
+    /// Desired and smoothed actual buffer fill, in input frames.
+    target: f64,
+    fill: f64,
+    primed: bool,
+    scratch: Vec<f32>,
+    /// Resampled frames (interleaved, `ich` channels) still to be played: `pending[pos..]`.
+    pending: Vec<f32>,
+    pos: usize,
+}
+
+impl Converter {
+    /// `ratio` is output rate / input rate.
+    fn new(ich: usize, ratio: f64, target: usize) -> Result<Self, String> {
+        let params = SincInterpolationParameters::new(64, WindowFunction::BlackmanHarris2)
+            .oversampling_factor(128)
+            .interpolation(SincInterpolationType::Linear);
+        let rs = Async::<f32>::new_sinc(ratio, 1.01, &params, CHUNK, ich, FixedAsync::Output)
+            .map_err(|e| e.to_string())?;
+        let scratch = vec![0.0; rs.input_frames_max() * ich];
+        let pending = vec![0.0; rs.output_frames_max() * ich];
+        let pos = pending.len();
+        Ok(Self { rs, ich, target: target as f64, fill: 0.0, primed: false, scratch, pending, pos })
     }
 
-    /// Fills `out` (`och` channels) from `cons`. Extra output channels repeat the last
-    /// input channel, so mono feeds both ears. `out` arrives silent, so an underrun leaves
-    /// silence. Returns false on underrun.
+    /// Fills `out` (`och` channels) from `cons`. `out` arrives silent, so an underrun
+    /// leaves silence; the converter then waits for `target` frames before resuming.
+    /// Returns false if `out` was not completely filled.
     fn fill(&mut self, out: &mut [f32], och: usize, cons: &mut impl Consumer<Item = f32>) -> bool {
-        let ich = self.a.len();
+        let ich = self.ich;
+        let avail = (cons.occupied_len() / ich) as f64;
+        if !self.primed {
+            if avail < self.target {
+                return false;
+            }
+            self.primed = true;
+            self.fill = avail;
+        }
+        // Proportional control, smoothed over ~0.5 s of ~10 ms callbacks. Too full means
+        // the input is faster: produce slightly fewer output frames per input frame.
+        self.fill += (avail - self.fill) * 0.02;
+        let err = (self.fill - self.target) / self.target;
+        let _ = self.rs.set_resample_ratio_relative((1.0 - 0.002 * err).clamp(0.995, 1.005), true);
+
         for frame in out.chunks_mut(och) {
-            while self.pos >= 1.0 {
-                if cons.occupied_len() < ich {
+            if self.pos == self.pending.len() {
+                let need = self.rs.input_frames_next();
+                if cons.occupied_len() < need * ich {
+                    self.primed = false;
                     return false;
                 }
-                std::mem::swap(&mut self.a, &mut self.b);
-                cons.pop_slice(&mut self.b);
-                self.pos -= 1.0;
+                let input = &mut self.scratch[..need * ich];
+                cons.pop_slice(input);
+                let input = InterleavedSlice::new(&*input, ich, need).unwrap();
+                let frames = self.pending.len() / ich;
+                let mut output = InterleavedSlice::new_mut(&mut self.pending[..], ich, frames).unwrap();
+                let Ok((_, written)) = self.rs.process_into_buffer(&input, &mut output, None) else {
+                    return false;
+                };
+                // Move the chunk to the end of `pending` so `pos == len` still means empty.
+                self.pos = self.pending.len() - written * ich;
+                self.pending.copy_within(..written * ich, self.pos);
             }
-            let t = self.pos as f32;
             for (c, s) in frame.iter_mut().enumerate() {
-                let i = c.min(ich - 1);
-                *s = self.a[i] + (self.b[i] - self.a[i]) * t;
+                *s = self.pending[self.pos + c.min(ich - 1)];
             }
-            self.pos += self.step;
+            self.pos += ich;
         }
         true
     }
@@ -420,21 +524,40 @@ fn meter(peak: f32) -> f32 {
     ((20.0 * peak.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
-fn settings_path() -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("NymPlayer").join("settings.txt"))
+/// Stored as lines in `%APPDATA%\NymPlayer\settings.txt`: input device name, output
+/// device name (empty = Windows default), volume (0..1), muted (0/1).
+struct Settings {
+    input: String,
+    output: String,
+    volume: f32,
+    muted: bool,
 }
 
-/// Line 1: input device name, line 2: output device name (empty = Windows default).
-fn load_settings() -> (String, String) {
-    let text = settings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    let mut lines = text.lines().map(str::to_owned);
-    (lines.next().unwrap_or_default(), lines.next().unwrap_or_default())
-}
+impl Settings {
+    fn path() -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("NymPlayer").join("settings.txt"))
+    }
 
-fn save_settings(inp: &str, out: &str) {
-    if let Some(p) = settings_path() {
-        let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let _ = std::fs::write(p, format!("{inp}\n{out}\n"));
+    fn load() -> Self {
+        Self::parse(&Self::path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default())
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut lines = text.lines();
+        Self {
+            input: lines.next().unwrap_or_default().to_owned(),
+            output: lines.next().unwrap_or_default().to_owned(),
+            volume: lines.next().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.0, 1.0),
+            muted: lines.next() == Some("1"),
+        }
+    }
+
+    fn save(&self) {
+        if let Some(p) = Self::path() {
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let muted = if self.muted { 1 } else { 0 };
+            let _ = std::fs::write(p, format!("{}\n{}\n{}\n{muted}\n", self.input, self.output, self.volume));
+        }
     }
 }
 
@@ -443,50 +566,71 @@ mod tests {
     use super::*;
 
     fn buffer(samples: &[f32]) -> ringbuf::HeapCons<f32> {
-        let (mut p, c) = HeapRb::new(64).split();
+        let (mut p, c) = HeapRb::new(samples.len()).split();
         p.push_slice(samples);
         c
     }
 
-    // The resampler starts from one silent frame and holds the newest frame as its
-    // interpolation target, so output lags input by one frame.
-    #[test]
-    fn same_rate_mono_to_stereo_and_underrun() {
-        let mut cons = buffer(&[0.1, 0.2]);
-        let mut out = [0.0; 6];
-        let mut r = Resampler::new(1, 1.0);
-        assert!(!r.fill(&mut out, 2, &mut cons));
-        assert_eq!(out, [0.0, 0.0, 0.1, 0.1, 0.0, 0.0]);
-        // The held frame comes out once more input arrives.
-        let mut cons = buffer(&[0.3]);
-        let mut out = [0.0; 2];
-        assert!(r.fill(&mut out, 2, &mut cons));
-        assert_eq!(out, [0.2, 0.2]);
+    /// Runs input through a fresh converter and returns `frames` output frames.
+    fn convert(input: &[f32], ich: usize, ratio: f64, och: usize, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames * och];
+        Converter::new(ich, ratio, 32).unwrap().fill(&mut out, och, &mut buffer(input));
+        out
     }
 
     #[test]
-    fn same_rate_stereo_keeps_channels() {
-        let mut cons = buffer(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]);
-        let mut out = [0.0; 6];
-        assert!(Resampler::new(2, 1.0).fill(&mut out, 2, &mut cons));
-        assert_eq!(out, [0.0, 0.0, 0.1, 0.2, 0.3, 0.4]);
-        assert_eq!(cons.occupied_len(), 1); // half a frame is never consumed
+    fn mono_feeds_both_channels() {
+        let out = convert(&[0.5; 4000], 1, 1.0, 2, 1000);
+        assert!(out[1000..].iter().all(|&x| (x - 0.5).abs() < 0.01), "{:?}", &out[1000..1010]);
     }
 
     #[test]
-    fn upsample_2x_interpolates() {
-        let mut cons = buffer(&[1.0, 3.0]);
-        let mut out = [0.0; 4];
-        assert!(Resampler::new(1, 0.5).fill(&mut out, 1, &mut cons));
-        assert_eq!(out, [0.0, 0.5, 1.0, 2.0]);
+    fn stereo_keeps_channels_apart() {
+        let out = convert(&[0.5, -0.25].repeat(2000), 2, 1.0, 2, 1000);
+        for f in out[1000..].chunks(2) {
+            assert!((f[0] - 0.5).abs() < 0.01 && (f[1] + 0.25).abs() < 0.01, "{f:?}");
+        }
     }
 
     #[test]
-    fn downsample_2x_skips_frames() {
-        let mut cons = buffer(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-        let mut out = [0.0; 3];
-        assert!(Resampler::new(1, 2.0).fill(&mut out, 1, &mut cons));
-        assert_eq!(out, [0.0, 2.0, 4.0]);
+    fn resamples_48k_to_44k1() {
+        let mut cons = buffer(&[0.5; 4800]);
+        let mut c = Converter::new(1, 44100.0 / 48000.0, 32).unwrap();
+        let mut out = [0.0; 100];
+        let mut produced = 0;
+        while c.fill(&mut out, 1, &mut cons) {
+            produced += out.len();
+        }
+        // ~4410, minus what the last partial block, the target fill and the filter hold back.
+        assert!((4200..=4410).contains(&produced), "{produced}");
+    }
+
+    #[test]
+    fn drains_overfull_buffer_faster() {
+        let consumed = |target| {
+            let mut cons = buffer(&[0.5; 20000]);
+            let mut out = vec![0.0; 10000];
+            Converter::new(1, 1.0, target).unwrap().fill(&mut out, 1, &mut cons);
+            20000 - cons.occupied_len()
+        };
+        // Far above target the ratio is clamped 0.5% low: ~50 extra frames per 10000.
+        let (overfull, on_target) = (consumed(32), consumed(20000));
+        assert!(overfull > on_target + 30, "{overfull} vs {on_target}");
+    }
+
+    #[test]
+    fn waits_for_target_fill() {
+        let mut out = [0.0; 100];
+        assert!(!Converter::new(1, 1.0, 32).unwrap().fill(&mut out, 1, &mut buffer(&[0.5; 10])));
+        assert!(out.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn settings_parse_new_and_old_format() {
+        let s = Settings::parse("Mic\nSpeakers\n0.25\n1\n");
+        assert_eq!((s.input.as_str(), s.output.as_str(), s.volume, s.muted), ("Mic", "Speakers", 0.25, true));
+        let old = Settings::parse("Mic\n\n");
+        assert_eq!((old.output.as_str(), old.volume, old.muted), ("", 1.0, false));
     }
 
     #[test]

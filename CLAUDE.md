@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What it is
 
-NymPlayer is a Windows-only Rust desktop app that passes live audio from an input device (typically a USB audio interface) to a chosen output device (speakers, Bluetooth headphones). The GUI has input/output dropdowns, level meters, and Play/Stop. User-facing description: `readme.md`.
+NymPlayer is a Windows-only Rust desktop app that passes live audio from an input device (typically a USB audio interface) to a chosen output device (speakers, Bluetooth headphones). The GUI has input/output dropdowns, level meters, volume/mute, and Play/Stop. User-facing description: `readme.md`.
 
 ## Commands
 
 ```sh
 cargo build --release          # binary: target/release/nymplayer.exe
-cargo test                     # unit tests (resampler, meter scale)
-cargo test upsample_2x         # run a single test by name filter
+cargo test                     # unit tests (converter, settings parsing, meter scale)
+cargo test resamples_48k       # run a single test by name filter
 python assets/make_icon.py     # regenerate assets/icon.png + icon.ico (stdlib only)
 ```
 
@@ -23,13 +23,19 @@ All app code is in `src/main.rs`. `build.rs` embeds `assets/icon.ico` into the e
 
 Audio path, in `start()`:
 - **cpal (WASAPI)**: an input stream and an output stream, each with its own callback thread.
-- **Input callback** → `ringbuf` lock-free SPSC buffer (capacity 60 ms). It pushes **whole frames only**, so channels never get shifted. When the buffer is full, the newest audio is dropped; that caps latency when the input clock runs faster than the output clock.
-- **Output callback** waits until 15 ms is buffered (re-primes after each underrun), then `Resampler::fill` does linear interpolation from `in_rate / out_rate` and maps channels. Extra output channels repeat the last input channel, so mono feeds both ears. Output buffers arrive pre-filled with silence from cpal.
-- The input must be f32 (`SampleFormat::F32`); other formats are rejected with an error.
+- **Input callback** (`build_input::<T>`, generic over f32/i16/i32/u16) converts to f32 and pushes into a `ringbuf` lock-free SPSC buffer (capacity 5× target). It pushes **whole frames only**, so channels never get shifted. When the buffer is full, the newest audio is dropped (a safety net only).
+- **Output callback** runs `Converter::fill`:
+  - It waits until `TARGET_MS` (20 ms) is buffered, and waits again after each underrun.
+  - It resamples with rubato's `Async` sinc resampler (fixed output chunks of `CHUNK` frames, ratio = out_rate / in_rate). Resampled frames sit in `pending[pos..]` until they're played.
+  - **Drift correction:** each callback nudges the ratio (±0.5% max, via `set_resample_ratio_relative`) in proportion to how far the smoothed buffer fill is from the target. This keeps the latency steady when the two device clocks differ, instead of dropping audio or underrunning.
+  - It maps channels: extra output channels repeat the last input channel, so mono feeds both ears.
+  - Output buffers arrive pre-filled with silence from cpal.
+- After the converter, the output callback multiplies by the gain (`App::gain`, f32 bits in an `AtomicU32`; 0 when muted).
+- The audio callbacks must not allocate: the scratch buffers are sized up front.
 - `Shared` (atomics only) carries peak levels (f32 bits with `fetch_max`) and a `failed` flag set by the cpal error callbacks.
 
 Device handling, in `App::sync()`:
-- `sync()` runs every second from `ui()`, and again on any user change.
+- `sync()` runs every second from `App::logic()`, which (unlike `ui()`) still runs while the window is minimized. It also runs on any device or Play/Stop change.
 - It re-enumerates devices and decides which devices to use: the saved selection if it's present, otherwise the Windows default. An empty selection string means "follow the Windows default".
 - It restarts the streams when that decision changes or when `failed` is set. This is how unplugging, re-plugging and default-device changes are handled.
 - Dropping `Running` stops the streams.
@@ -38,11 +44,12 @@ Device names:
 - Devices are identified by **name**, via `description().name()`.
 - Never use `Device::to_string()`: its `Display` impl returns `fmt::Error` for a vanished device, and that panics.
 
-Settings are two lines (input name, output name) in `%APPDATA%\NymPlayer\settings.txt`, saved on every change and loaded at startup.
+Settings (`Settings`) are lines in `%APPDATA%\NymPlayer\settings.txt`: input name, output name, volume, muted (0/1). Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
 
 GUI notes:
 - eframe/egui 0.36 uses `App::ui(&mut self, ui, frame)`, not `update`.
 - The theme lives in `apply_theme`; its colours (`ACCENT`, `WOOD`, …) are taken from the icon.
+- The slider rail uses `widgets.inactive.bg_fill`, so that colour must differ from the `SURFACE` panel the slider sits on.
 - egui's built-in fonts lack many Unicode symbols (`→`, `●` render as boxes). Paint shapes with the painter or use plain text instead.
 
 ## Conventions
