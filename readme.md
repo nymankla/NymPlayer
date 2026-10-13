@@ -8,7 +8,9 @@ A small Windows app that plays live audio from an input device, such as a USB au
 - **Play / Stop** to start or stop the audio passthrough.
 - **Level meters** for input and output.
 - **Volume and mute.**
-- **Remembers your settings.** Devices, volume and mute are saved and restored on the next start.
+- **Start with Windows and keep in the tray** (optional). With this on, the app starts hidden in the tray and minimizing hides it there. Click the tray icon to show the window, or right-click for Play/Stop and Quit. Turning it off removes the tray icon and the autostart entry, and the app minimizes normally.
+- **Remembers your settings.** Devices, volume and mute are saved. If the app was playing when you closed it, it starts playing again on the next launch.
+- **One copy at a time.** Starting NymPlayer again brings the running copy to the front.
 - **Automatic device switching**, also while minimized. If the chosen device is unplugged, playback moves to the Windows default and switches back when the device returns. "Windows default" follows changes to the system default.
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.

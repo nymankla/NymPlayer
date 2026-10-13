@@ -11,26 +11,109 @@ use rubato::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+mod system;
 
 /// Empty selection means "follow the Windows default device".
 const WINDOWS_DEFAULT: &str = "";
 
 fn main() -> eframe::Result {
+    let Some(show_requests) = system::single_instance() else {
+        return Ok(()); // another copy is running and has been asked to show itself
+    };
+    // Only hide at start while tray mode is on; otherwise there'd be no way back.
+    let start_hidden = std::env::args().any(|a| a == system::TRAY_FLAG) && system::autostart();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 300.0])
+            .with_inner_size([500.0, 355.0])
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap()),
         ..Default::default()
     };
     eframe::run_native(
         "NymPlayer",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             cc.egui_ctx.all_styles_mut(apply_theme);
-            Ok(Box::new(App::new()))
+            if start_hidden {
+                // eframe always shows the window after its first frame, so minimize it
+                // instead; the minimize-to-tray logic then hides it.
+                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            // Without a tray icon the app still works; it just minimizes normally. The tray
+            // is still created when tray mode is off: its channel also carries Show requests
+            // from a second copy of the app.
+            let tray = Tray::new(&cc.egui_ctx, show_requests).ok();
+            Ok(Box::new(App::new(tray)))
         }),
     )
+}
+
+/// Requests from outside the egui loop: the tray icon and its menu, or a second copy of
+/// the app being started.
+enum Cmd {
+    Show,
+    TogglePlay,
+    Quit,
+}
+
+struct Tray {
+    icon: TrayIcon,
+    play_item: MenuItem,
+    cmds: mpsc::Receiver<Cmd>,
+}
+
+impl Tray {
+    fn new(ctx: &egui::Context, show_requests: system::ShowRequests) -> Result<Self, String> {
+        let e = |e: &dyn std::fmt::Display| e.to_string();
+        let (tx, cmds) = mpsc::channel();
+        let ctx = ctx.clone();
+        // The handlers run outside egui; wake it so `logic` picks the command up, even
+        // while the window is hidden.
+        let send = move |cmd| {
+            let _ = tx.send(cmd);
+            ctx.request_repaint();
+        };
+
+        let show = MenuItem::new("Show NymPlayer", true, None);
+        let play_item = MenuItem::new("Play", true, None);
+        let quit = MenuItem::new("Quit", true, None);
+        let menu = Menu::new();
+        for item in [&show as &dyn tray_icon::menu::IsMenuItem, &play_item, &PredefinedMenuItem::separator(), &quit] {
+            menu.append(item).map_err(|x| e(&x))?;
+        }
+        let ids = [show.id().clone(), play_item.id().clone(), quit.id().clone()];
+        let s = send.clone();
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            match ids.iter().position(|id| *id == ev.id) {
+                Some(0) => s(Cmd::Show),
+                Some(1) => s(Cmd::TogglePlay),
+                Some(2) => s(Cmd::Quit),
+                _ => {}
+            }
+        }));
+        let s = send.clone();
+        TrayIconEvent::set_event_handler(Some(move |ev| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
+                s(Cmd::Show);
+            }
+        }));
+        show_requests.watch(move || send(Cmd::Show));
+
+        // Resource 1 is the icon build.rs embeds in the exe.
+        let icon = Icon::from_resource(1, None).map_err(|x| e(&x))?;
+        let tray = TrayIconBuilder::new()
+            .with_icon(icon)
+            .with_tooltip("NymPlayer")
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .build()
+            .map_err(|x| e(&x))?;
+        Ok(Self { icon: tray, play_item, cmds })
+    }
 }
 
 // Colours taken from the icon.
@@ -99,32 +182,64 @@ struct App {
     settings: Settings,
     /// Output gain as f32 bits, read by the output callback; 0 when muted.
     gain: Arc<AtomicU32>,
-    playing: bool,
     running: Option<Running>,
     status: String,
     last_sync: Instant,
     in_level: f32,
     out_level: f32,
+    tray: Option<Tray>,
+    /// Window is hidden in the tray.
+    hidden: bool,
+    /// Registered to start with Windows (the registry is the source of truth).
+    autostart: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(tray: Option<Tray>) -> Self {
+        let autostart = system::autostart();
+        if autostart {
+            let _ = system::set_autostart(true); // refresh the path in case the exe moved
+        }
         let mut app = Self {
             host: cpal::default_host(),
             inputs: vec![],
             outputs: vec![],
             settings: Settings::load(),
             gain: Arc::default(),
-            playing: false,
             running: None,
             status: "Stopped".into(),
             last_sync: Instant::now(),
             in_level: 0.0,
             out_level: 0.0,
+            tray,
+            hidden: false,
+            autostart,
         };
         app.update_gain();
-        app.sync();
+        app.show_tray_icon(autostart);
+        // Resumes playback if the app was playing when it was last closed.
+        app.set_playing(app.settings.playing);
         app
+    }
+
+    /// Tray mode is tied to "Start with Windows": off means no tray icon and a normal
+    /// minimize.
+    fn show_tray_icon(&self, on: bool) {
+        if let Some(t) = &self.tray {
+            let _ = t.icon.set_visible(on);
+        }
+    }
+
+    fn set_playing(&mut self, on: bool) {
+        if on != self.settings.playing {
+            self.settings.playing = on;
+            self.settings.save();
+        }
+        self.status = "Stopped".into();
+        if let Some(t) = &self.tray {
+            t.play_item.set_text(if on { "Stop" } else { "Play" });
+        }
+        self.sync();
     }
 
     fn update_gain(&self) {
@@ -139,7 +254,7 @@ impl App {
         self.last_sync = Instant::now();
         self.inputs = self.host.input_devices().map(names).unwrap_or_default();
         self.outputs = self.host.output_devices().map(names).unwrap_or_default();
-        if !self.playing {
+        if !self.settings.playing {
             self.running = None;
             return;
         }
@@ -175,10 +290,32 @@ impl App {
 impl eframe::App for App {
     // Runs even while the window is minimized (unlike `ui`), so device switching keeps working.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        use egui::ViewportCommand as V;
+        while let Some(cmd) = self.tray.as_ref().and_then(|t| t.cmds.try_recv().ok()) {
+            match cmd {
+                Cmd::Show => {
+                    ctx.send_viewport_cmd(V::Visible(true));
+                    ctx.send_viewport_cmd(V::Minimized(false));
+                    ctx.send_viewport_cmd(V::Focus);
+                }
+                Cmd::TogglePlay => self.set_playing(!self.settings.playing),
+                Cmd::Quit => ctx.send_viewport_cmd(V::Close),
+            }
+        }
+        // Minimizing hides the window to the tray. `hidden` only clears once the window
+        // reports it's restored, so a stale "minimized" right after Show can't re-hide it.
+        let minimized = ctx.input(|i| i.viewport().minimized);
+        if self.hidden {
+            self.hidden = minimized != Some(false);
+        } else if minimized == Some(true) && self.tray.is_some() && self.autostart {
+            ctx.send_viewport_cmd(V::Visible(false));
+            self.hidden = true;
+        }
+
         if self.last_sync.elapsed() > Duration::from_secs(1) {
             self.sync();
         }
-        let wait = if self.running.is_some() { 33 } else { 1000 };
+        let wait = if self.running.is_some() && !self.hidden { 33 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(wait));
     }
 
@@ -193,6 +330,7 @@ impl eframe::App for App {
 
         let mut changed = false;
         let mut volume_done = false;
+        let mut toggle = false;
         let live = self.running.is_some();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0))
@@ -235,23 +373,19 @@ impl eframe::App for App {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let (label, fill) = if self.playing {
+                    let (label, fill) = if self.settings.playing {
                         ("⏹  Stop", egui::Color32::from_rgb(70, 70, 80))
                     } else {
                         ("▶  Play", ACCENT)
                     };
                     let text = egui::RichText::new(label).size(18.0).strong().color(egui::Color32::WHITE);
                     let button = egui::Button::new(text).fill(fill).corner_radius(18).min_size(egui::vec2(120.0, 36.0));
-                    if ui.add(button).clicked() {
-                        self.playing = !self.playing;
-                        self.status = "Stopped".into();
-                        changed = true;
-                    }
+                    toggle = ui.add(button).clicked();
                     let dot = if live {
                         GREEN
                     } else if self.status.starts_with("Error") {
                         ACCENT
-                    } else if self.playing {
+                    } else if self.settings.playing {
                         AMBER
                     } else {
                         egui::Color32::GRAY
@@ -260,7 +394,22 @@ impl eframe::App for App {
                     ui.painter().circle_filled(r.center(), 5.0, dot);
                     ui.add(egui::Label::new(&self.status).truncate());
                 });
+                ui.add_space(12.0);
+                let mut on = self.autostart;
+                if ui.checkbox(&mut on, "Start with Windows and keep in the tray").changed() {
+                    match system::set_autostart(on) {
+                        Ok(()) => {
+                            self.autostart = on;
+                            self.show_tray_icon(on);
+                        }
+                        Err(e) => self.status = format!("Error: {e}"),
+                    }
+                }
             });
+
+        if toggle {
+            self.set_playing(!self.settings.playing);
+        }
 
         if changed || volume_done {
             self.settings.save();
@@ -525,12 +674,14 @@ fn meter(peak: f32) -> f32 {
 }
 
 /// Stored as lines in `%APPDATA%\NymPlayer\settings.txt`: input device name, output
-/// device name (empty = Windows default), volume (0..1), muted (0/1).
+/// device name (empty = Windows default), volume (0..1), muted (0/1), playing (0/1).
 struct Settings {
     input: String,
     output: String,
     volume: f32,
     muted: bool,
+    /// Playing when last closed; playback resumes on the next start.
+    playing: bool,
 }
 
 impl Settings {
@@ -549,14 +700,16 @@ impl Settings {
             output: lines.next().unwrap_or_default().to_owned(),
             volume: lines.next().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.0, 1.0),
             muted: lines.next() == Some("1"),
+            playing: lines.next() == Some("1"),
         }
     }
 
     fn save(&self) {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let muted = if self.muted { 1 } else { 0 };
-            let _ = std::fs::write(p, format!("{}\n{}\n{}\n{muted}\n", self.input, self.output, self.volume));
+            let (muted, playing) = (self.muted as u8, self.playing as u8);
+            let text = format!("{}\n{}\n{}\n{muted}\n{playing}\n", self.input, self.output, self.volume);
+            let _ = std::fs::write(p, text);
         }
     }
 }
@@ -627,10 +780,11 @@ mod tests {
 
     #[test]
     fn settings_parse_new_and_old_format() {
-        let s = Settings::parse("Mic\nSpeakers\n0.25\n1\n");
+        let s = Settings::parse("Mic\nSpeakers\n0.25\n1\n1\n");
         assert_eq!((s.input.as_str(), s.output.as_str(), s.volume, s.muted), ("Mic", "Speakers", 0.25, true));
+        assert!(s.playing);
         let old = Settings::parse("Mic\n\n");
-        assert_eq!((old.output.as_str(), old.volume, old.muted), ("", 1.0, false));
+        assert_eq!((old.output.as_str(), old.volume, old.muted, old.playing), ("", 1.0, false, false));
     }
 
     #[test]
