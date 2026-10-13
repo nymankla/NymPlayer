@@ -1,0 +1,45 @@
+name: Bug report
+description: Something doesn't work, or sounds wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you hear or see? For example no sound, clicks, delay, or an error in the status line.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Select input ... and output ...
+        2. Press Play
+        3. Unplug ...
+    validations:
+      required: true
+  - type: input
+    id: input
+    attributes:
+      label: Input device
+      description: As named in the Input dropdown.
+    validations:
+      required: true
+  - type: input
+    id: output
+    attributes:
+      label: Output device
+      description: As named in the Output dropdown. Mention if it's Bluetooth.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+  - type: input
+    id: version
+    attributes:
+      label: NymPlayer version or commit
+      placeholder: 0.1.0 or a commit hash
