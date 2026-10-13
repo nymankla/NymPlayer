@@ -170,6 +170,8 @@ struct Shared {
 struct Running {
     _input: cpal::Stream,
     _output: cpal::Stream,
+    in_id: String,
+    out_id: String,
     in_name: String,
     out_name: String,
     shared: Arc<Shared>,
@@ -177,8 +179,8 @@ struct Running {
 
 struct App {
     host: cpal::Host,
-    inputs: Vec<String>,
-    outputs: Vec<String>,
+    inputs: Vec<Entry>,
+    outputs: Vec<Entry>,
     settings: Settings,
     /// Output gain as f32 bits, read by the output callback; 0 when muted.
     gain: Arc<AtomicU32>,
@@ -252,8 +254,12 @@ impl App {
     /// changed: unplugged, plugged back in, or a new Windows default.
     fn sync(&mut self) {
         self.last_sync = Instant::now();
-        self.inputs = self.host.input_devices().map(names).unwrap_or_default();
-        self.outputs = self.host.output_devices().map(names).unwrap_or_default();
+        self.inputs = self.host.input_devices().map(entries).unwrap_or_default();
+        self.outputs = self.host.output_devices().map(entries).unwrap_or_default();
+        let s = &mut self.settings;
+        if migrate(&mut s.input, &self.inputs) | migrate(&mut s.output, &self.outputs) {
+            s.save();
+        }
         if !self.settings.playing {
             self.running = None;
             return;
@@ -261,11 +267,11 @@ impl App {
         let s = &self.settings;
         let inp = pick(self.host.input_devices().ok(), self.host.default_input_device(), &s.input);
         let out = pick(self.host.output_devices().ok(), self.host.default_output_device(), &s.output);
-        let want = (inp.as_ref().and_then(name), out.as_ref().and_then(name));
+        let want = (inp.as_ref().and_then(dev_id), out.as_ref().and_then(dev_id));
         let stale = match &self.running {
             Some(r) => {
                 r.shared.failed.load(Ordering::Relaxed)
-                    || want != (Some(r.in_name.clone()), Some(r.out_name.clone()))
+                    || want != (Some(r.in_id.clone()), Some(r.out_id.clone()))
             }
             None => true,
         };
@@ -450,16 +456,20 @@ fn level_meter(ui: &mut egui::Ui, level: f32) {
     }
 }
 
-fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut String, list: &[String]) -> bool {
-    let shown = if sel.is_empty() { "Windows default" } else { sel.as_str() };
+fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut String, list: &[Entry]) -> bool {
+    let shown = if sel.is_empty() {
+        "Windows default"
+    } else {
+        list.iter().find(|e| e.id == *sel).map_or("Saved device (not connected)", |e| e.label.as_str())
+    };
     let before = sel.clone();
     egui::ComboBox::from_id_salt(id)
         .width(240.0)
         .selected_text(shown)
         .show_ui(ui, |ui| {
             ui.selectable_value(sel, WINDOWS_DEFAULT.to_string(), "Windows default");
-            for n in list {
-                ui.selectable_value(sel, n.clone(), n);
+            for e in list {
+                ui.selectable_value(sel, e.id.clone(), &e.label);
             }
         });
     *sel != before
@@ -470,11 +480,52 @@ fn name(d: &cpal::Device) -> Option<String> {
     d.description().ok().map(|d| d.name().to_owned())
 }
 
-fn names(devs: impl Iterator<Item = cpal::Device>) -> Vec<String> {
-    devs.filter_map(|d| name(&d)).collect()
+/// Stable device ID, e.g. `wasapi:{0.0.1.00000000}.{guid}`. Windows keeps it across reboots
+/// and re-plugging into the same USB port; cpal persists it via Display/FromStr.
+fn dev_id(d: &cpal::Device) -> Option<String> {
+    d.id().ok().map(|i| i.to_string())
 }
 
-/// The selected device if present, otherwise the Windows default.
+/// A device in a dropdown: its ID (what settings store), name, and a label that tells
+/// identical devices apart.
+#[derive(Debug, PartialEq)]
+struct Entry {
+    id: String,
+    name: String,
+    label: String,
+}
+
+fn entries(devs: impl Iterator<Item = cpal::Device>) -> Vec<Entry> {
+    label_entries(devs.filter_map(|d| Some((dev_id(&d)?, name(&d)?))))
+}
+
+/// Numbers repeated names ("USB Codec", "USB Codec (2)") so identical devices differ.
+fn label_entries(devs: impl Iterator<Item = (String, String)>) -> Vec<Entry> {
+    let mut out: Vec<Entry> = vec![];
+    for (id, name) in devs {
+        let n = out.iter().filter(|e| e.name == name).count();
+        let label = if n == 0 { name.clone() } else { format!("{name} ({})", n + 1) };
+        out.push(Entry { id, name, label });
+    }
+    out
+}
+
+/// Settings from before device IDs hold a device name: switch to that device's ID once
+/// it's present. Returns true if `sel` changed.
+fn migrate(sel: &mut String, list: &[Entry]) -> bool {
+    if sel.is_empty() || list.iter().any(|e| e.id == *sel) {
+        return false;
+    }
+    match list.iter().find(|e| e.name == *sel) {
+        Some(e) => {
+            *sel = e.id.clone();
+            true
+        }
+        None => false,
+    }
+}
+
+/// The selected device (by ID) if present, otherwise the Windows default.
 fn pick(
     devs: Option<impl Iterator<Item = cpal::Device>>,
     default: Option<cpal::Device>,
@@ -483,8 +534,7 @@ fn pick(
     if sel.is_empty() {
         return default;
     }
-    // shortcut: matched by name, so two identical USB devices are indistinguishable.
-    devs.and_then(|mut d| d.find(|d| name(d).as_deref() == Some(sel))).or(default)
+    devs.and_then(|mut d| d.find(|d| dev_id(d).as_deref() == Some(sel))).or(default)
 }
 
 fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result<Running, String> {
@@ -532,6 +582,8 @@ fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result
     Ok(Running {
         _input: input,
         _output: output,
+        in_id: dev_id(inp).unwrap_or_default(),
+        out_id: dev_id(out).unwrap_or_default(),
         in_name: name(inp).unwrap_or_default(),
         out_name: name(out).unwrap_or_default(),
         shared,
@@ -673,8 +725,8 @@ fn meter(peak: f32) -> f32 {
     ((20.0 * peak.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
-/// Stored as lines in `%APPDATA%\NymPlayer\settings.txt`: input device name, output
-/// device name (empty = Windows default), volume (0..1), muted (0/1), playing (0/1).
+/// Stored as lines in `%APPDATA%\NymPlayer\settings.txt`: input device ID, output
+/// device ID (empty = Windows default; older files hold names, see `migrate`), volume (0..1), muted (0/1), playing (0/1).
 struct Settings {
     input: String,
     output: String,
@@ -785,6 +837,26 @@ mod tests {
         assert!(s.playing);
         let old = Settings::parse("Mic\n\n");
         assert_eq!((old.output.as_str(), old.volume, old.muted, old.playing), ("", 1.0, false, false));
+    }
+
+    #[test]
+    fn identical_devices_get_numbered_labels() {
+        let pairs = [("a", "USB Codec"), ("b", "Speakers"), ("c", "USB Codec")];
+        let list = label_entries(pairs.iter().map(|(i, n)| (i.to_string(), n.to_string())));
+        let labels: Vec<_> = list.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["USB Codec", "Speakers", "USB Codec (2)"]);
+    }
+
+    #[test]
+    fn old_name_settings_migrate_to_ids() {
+        let list = label_entries([("id1".into(), "Mic".into())].into_iter());
+        let mut sel = "Mic".to_string();
+        assert!(migrate(&mut sel, &list));
+        assert_eq!(sel, "id1");
+        assert!(!migrate(&mut sel, &list)); // already an ID
+        let mut gone = "Unplugged".to_string();
+        assert!(!migrate(&mut gone, &list)); // kept until the device shows up
+        assert!(!migrate(&mut String::new(), &list)); // Windows default
     }
 
     #[test]

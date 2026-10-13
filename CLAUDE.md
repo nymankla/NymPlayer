@@ -44,9 +44,11 @@ Device handling, in `App::sync()`:
 - It restarts the streams when that decision changes or when `failed` is set. This is how unplugging, re-plugging and default-device changes are handled.
 - Dropping `Running` stops the streams.
 
-Device names:
-- Devices are identified by **name**, via `description().name()`.
-- Never use `Device::to_string()`: its `Display` impl returns `fmt::Error` for a vanished device, and that panics.
+Device identity:
+- Devices are identified by **cpal's `DeviceId`**, kept as a string (`dev_id()`, e.g. `wasapi:{0.0.0.00000000}.{guid}`). Settings store the ID; an empty string means "Windows default".
+- The dropdowns show `Entry::label`, the device name with duplicates numbered "(2)", "(3)".
+- `migrate()` converts settings saved before IDs existed, which hold a device name: once a device with that name is present, the setting is switched to its ID and saved.
+- Get names via `description().name()`. Never use `Device::to_string()`: its `Display` impl returns `fmt::Error` for a vanished device, and that panics.
 
 Tray and window:
 - The tray icon (`tray-icon` crate) uses the exe's embedded icon (resource 1).
@@ -56,7 +58,7 @@ Tray and window:
 - eframe always makes the window visible after its first frame, so `ViewportBuilder::with_visible(false)` doesn't work. `--tray` instead minimizes the window at startup, and the minimize-to-tray logic then hides it.
 - `src/system.rs` has a registry test, `autostart_round_trip`. It's `#[ignore]`d because it touches the real Run key (and restores it); run it with `cargo test -- --include-ignored`.
 
-Settings (`Settings`) are lines in `%APPDATA%\NymPlayer\settings.txt`: input name, output name, volume, muted (0/1), playing (0/1). Playback resumes at startup if `playing` was set. Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
+Settings (`Settings`) are lines in `%APPDATA%\NymPlayer\settings.txt`: input device ID, output device ID, volume, muted (0/1), playing (0/1). Playback resumes at startup if `playing` was set. Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
 
 GUI notes:
 - eframe/egui 0.36 uses `App::ui(&mut self, ui, frame)`, not `update`.
