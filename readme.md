@@ -63,7 +63,7 @@ Things to know:
 - **The speaker must be able to connect to this PC.** A Cast speaker fetches the audio from NymPlayer over your network, so the first time you cast, Windows asks whether to allow NymPlayer through the firewall: allow it on **private networks**. If your Wi-Fi is set to *Public*, change it to *Private* in Windows settings (Network & internet → Wi-Fi → your network). On a company-managed PC, the firewall may block this entirely; NymPlayer then shows *"… didn't connect to NymPlayer"* after 10 seconds.
 - **Delay:** speakers buffer a few seconds of audio, so casting suits music, not live monitoring.
 - The audio is sent uncompressed (about 1.5 Mbit/s), which any home Wi-Fi handles.
-- Casting is new and hasn't been fully tested yet: reports of what works with your speakers are welcome.
+- Casting has been confirmed working with a Google speaker on a home network, but it's still new and only a few speaker models have been tried. Reports of what works with your speakers are welcome.
 
 ## macOS and Linux
 

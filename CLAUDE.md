@@ -44,7 +44,7 @@ Casting (`src/cast.rs`, experimental), an alternative to the local output device
 - **Session:** `cast::Session::start` serves the live input as endless 16-bit stereo WAV over a small `std` HTTP server (bound to the local address that routes to the speaker), then a control thread uses `oxicast` to launch the Default Media Receiver and load that URL as a live stream. The ring buffer holds 2 s for casting. A new HTTP request takes over and clears stale audio.
 - **Threads:** `oxicast` is async; each discovery and each session runs a current-thread tokio runtime on its own thread. The GUI and audio code stay synchronous.
 - **Ending:** dropping `Session` stops the stream and the speaker app. If the speaker ends the session, or never fetches the stream within 10 s (usually the firewall), `Session::ended` returns a reason; `sync()` then stops playback rather than switching to the local output.
-- The speaker must open an incoming connection to this PC, so a firewall that blocks inbound traffic (e.g. company policy) makes casting impossible. The streaming itself is covered by the loopback test `serves_live_wav_over_http`.
+- The speaker must open an incoming connection to this PC, so a firewall that blocks inbound traffic (e.g. company policy) makes casting impossible. Live WAV casting is confirmed working on a real Google speaker (a few seconds of buffering, set by the receiver); the streaming is also covered by the loopback test `serves_live_wav_over_http`.
 
 Device handling, in `App::sync()`:
 - `sync()` runs every second from `App::logic()`, which (unlike `ui()`) still runs while the window is minimized. It also runs on any device or Play/Stop change.
