@@ -63,6 +63,7 @@ Settings (`Settings`) are lines in `NymPlayer/settings.txt` under `system::confi
 
 GUI notes:
 - eframe/egui 0.36 uses `App::ui(&mut self, ui, frame)`, not `update`.
+- Start-up speed: eframe uses the **glow** (OpenGL) renderer with default features off. The default wgpu renderer took 1.9–3 s to start on Windows, while glow takes about 0.2 s. Don't re-enable wgpu or eframe's default features without measuring. Opening the audio streams takes about 250 ms, so `App::new` only lists devices, and the first `sync()` (which resumes playback) runs on the first `logic` pass after the first frame is drawn.
 - The theme lives in `apply_theme`; its colours (`ACCENT`, `WOOD`, …) are taken from the icon.
 - The slider rail uses `widgets.inactive.bg_fill`, so that colour must differ from the `SURFACE` panel the slider sits on.
 - egui's built-in fonts lack many Unicode symbols (`→`, `●` render as boxes). Paint shapes with the painter or use plain text instead.

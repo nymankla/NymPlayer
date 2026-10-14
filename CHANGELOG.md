@@ -4,7 +4,10 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-14
+
 ### Changed
+- Much faster start-up: the window appears in about 0.25 s instead of 2–3 s. NymPlayer now draws with OpenGL instead of wgpu, and opens the audio devices just after the window is shown. The `.exe` is also smaller (8 MB instead of 15 MB).
 - Windows-specific code is isolated in `src/system/`, so the app builds on macOS and Linux (untested with real audio there; no single instance, autostart or tray icon yet). CI now builds and tests on all three.
 
 ## [0.1.1] - 2026-10-14
@@ -36,6 +39,7 @@ First release.
 - Only one copy runs at a time; starting it again brings the running copy to the front.
 - Record-player icon.
 
-[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/nymankla/NymPlayer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nymankla/NymPlayer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nymankla/NymPlayer/releases/tag/v0.1.0

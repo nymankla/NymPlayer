@@ -1,12 +1,12 @@
 [package]
 name = "nymplayer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 
 [dependencies]
 cpal = "0.18.2"
-eframe = "0.36.2"
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 ringbuf = "0.5.3"
 rubato = "5.0.1"
 tray-icon = "0.26.1"

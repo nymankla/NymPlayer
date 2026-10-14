@@ -216,7 +216,8 @@ impl App {
             gain: Arc::default(),
             running: None,
             status: "Stopped".into(),
-            last_sync: Instant::now(),
+            // Overdue, so the first sync runs right after the first frame.
+            last_sync: Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now),
             in_level: 0.0,
             out_level: 0.0,
             tray,
@@ -225,8 +226,15 @@ impl App {
         };
         app.update_gain();
         app.show_tray_icon(autostart);
-        // Resumes playback if the app was playing when it was last closed.
-        app.set_playing(app.settings.playing);
+        app.refresh_devices();
+        // Playback resumes (if it was playing when last closed) on the first `logic` pass
+        // after the window is drawn, as opening the streams takes ~250 ms.
+        if app.settings.playing {
+            app.status = "Starting…".into();
+            if let Some(t) = &app.tray {
+                t.play_item.set_text("Stop");
+            }
+        }
         app
     }
 
@@ -279,14 +287,18 @@ impl App {
         }
     }
 
-    fn sync(&mut self) {
-        self.last_sync = Instant::now();
+    fn refresh_devices(&mut self) {
         self.inputs = self.host.input_devices().map(entries).unwrap_or_default();
         self.outputs = self.host.output_devices().map(entries).unwrap_or_default();
         let s = &mut self.settings;
         if migrate(&mut s.input, &self.inputs) | migrate(&mut s.output, &self.outputs) {
             s.save();
         }
+    }
+
+    fn sync(&mut self) {
+        self.last_sync = Instant::now();
+        self.refresh_devices();
         if !self.settings.playing {
             self.running = None;
             return;
@@ -345,11 +357,13 @@ impl eframe::App for App {
             self.hidden = true;
         }
 
-        if self.last_sync.elapsed() > Duration::from_secs(1) {
+        // Not before the first frame is drawn, so the window shows without waiting for audio.
+        let first_frame = ctx.cumulative_frame_nr() == 0;
+        if !first_frame && self.last_sync.elapsed() > Duration::from_secs(1) {
             self.trace();
             self.sync();
         }
-        let wait = if self.running.is_some() && !self.hidden { 33 } else { 1000 };
+        let wait = if first_frame { 0 } else if self.running.is_some() && !self.hidden { 33 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(wait));
     }
 
