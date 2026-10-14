@@ -11,10 +11,19 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: windows-latest
+    # macOS and Linux only check that the app still builds and its tests pass there;
+    # releases are Windows-only.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install Linux libraries (ALSA, GTK for the tray crate)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libxkbcommon-dev
       - run: cargo build --release
       - run: cargo test

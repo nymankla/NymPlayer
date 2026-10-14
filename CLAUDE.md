@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What it is
 
-NymPlayer is a Windows-only Rust desktop app that passes live audio from an input device (typically a USB audio interface) to a chosen output device (speakers, Bluetooth headphones). The GUI has input/output dropdowns, level meters, volume/mute, and Play/Stop. User-facing description: `readme.md`.
+NymPlayer is a Rust desktop app, released for Windows only (it builds on macOS and Linux, see Platform code), that passes live audio from an input device (typically a USB audio interface) to a chosen output device (speakers, Bluetooth headphones). The GUI has input/output dropdowns, level meters, volume/mute, and Play/Stop. User-facing description: `readme.md`.
 
 ## Commands
 
@@ -19,7 +19,7 @@ The release build fails with "failed to remove file ... nymplayer.exe" when the 
 
 ## Architecture
 
-App code is in `src/main.rs`. Win32 integration lives in `src/system.rs`:
+App code is in `src/main.rs`. Platform code lives under `src/system/` (see Platform code). On Windows (`src/system/windows.rs`):
 - **Single instance:** a named event `Local\NymPlayer.Show`. A second copy signals it and exits; the first copy's waiting thread turns the signal into `Cmd::Show`.
 - **Autostart:** the `HKCU\...\Run` value `NymPlayer`, which launches the exe with `--tray`. The registry is the source of truth for the checkbox.
 
@@ -57,15 +57,25 @@ Tray and window:
 - Tray and menu events arrive in handlers outside egui. Those handlers send a `Cmd` over an mpsc channel and call `request_repaint`, and `App::logic` drains the channel. This also works while the window is hidden.
 - When the window reports it's minimized, `logic` hides it (`Visible(false)`).
 - eframe always makes the window visible after its first frame, so `ViewportBuilder::with_visible(false)` doesn't work. `--tray` instead minimizes the window at startup, and the minimize-to-tray logic then hides it.
-- `src/system.rs` has a registry test, `autostart_round_trip`. It's `#[ignore]`d because it touches the real Run key (and restores it); run it with `cargo test -- --include-ignored`.
+- `src/system/windows.rs` has a registry test, `autostart_round_trip`. It's `#[ignore]`d because it touches the real Run key (and restores it); run it with `cargo test -- --include-ignored`.
 
-Settings (`Settings`) are lines in `%APPDATA%\NymPlayer\settings.txt`: input device ID, output device ID, volume, muted (0/1), playing (0/1). Playback resumes at startup if `playing` was set. Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
+Settings (`Settings`) are lines in `NymPlayer/settings.txt` under `system::config_dir()` (`%APPDATA%` on Windows): input device ID, output device ID, volume, muted (0/1), playing (0/1). Playback resumes at startup if `playing` was set. Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
 
 GUI notes:
 - eframe/egui 0.36 uses `App::ui(&mut self, ui, frame)`, not `update`.
 - The theme lives in `apply_theme`; its colours (`ACCENT`, `WOOD`, …) are taken from the icon.
 - The slider rail uses `widgets.inactive.bg_fill`, so that colour must differ from the `SURFACE` panel the slider sits on.
 - egui's built-in fonts lack many Unicode symbols (`→`, `●` render as boxes). Paint shapes with the painter or use plain text instead.
+
+## Platform code
+
+All OS-specific code lives under `src/system/`. `src/system.rs` picks `windows.rs` or `other.rs` (macOS/Linux fallbacks: no single instance, autostart or tray icon) and its doc comment lists the API every platform file provides. `main.rs` only calls `system::*` and must stay platform-neutral (its `#![windows_subsystem]` attribute is the one exception; other targets ignore it). CI builds and tests on Windows, macOS and Linux; releases are Windows-only.
+
+**Warn the user whenever a change would put OS-specific code outside `src/system/`**, then move it behind the `system` API instead. Signs of creep:
+- `#[cfg(windows)]`, `cfg!(target_os = ...)`, `windows-sys`/Win32 calls, or Windows-only crate APIs such as `Icon::from_resource`
+- Windows paths or environment variables (`%APPDATA%`, the registry, `\` separators in code)
+- user-facing text that names Windows ("Windows default", "Start with Windows"); take it from a `system::` constant
+- new dependencies that only build on one OS: declare them under `[target.'cfg(...)'.dependencies]` in Cargo.toml
 
 ## Conventions
 

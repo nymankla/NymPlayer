@@ -51,9 +51,15 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.
 
+## macOS and Linux
+
+NymPlayer is prepared for macOS and Linux: the code builds and its tests pass on both in CI, and all Windows-specific code is isolated in `src/system/`. It hasn't been run with real audio hardware there, though, because I don't have a Mac or a Linux machine to test on. On those systems there's currently no single-instance check, no autostart and no tray icon.
+
+**Help is very welcome!** If you have a Mac or a Linux machine with an audio interface, please try it, report what works and what doesn't, or implement the missing parts in `src/system/other.rs`. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Build from source
 
-Requires Windows and the [Rust toolchain](https://rustup.rs) (MSVC).
+Requires the [Rust toolchain](https://rustup.rs) (on Windows, the MSVC toolchain). On Linux, install the ALSA and GTK development packages first, e.g. on Debian/Ubuntu: `sudo apt install libasound2-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libxkbcommon-dev`.
 
 ```sh
 cargo build --release

@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 mod system;
 
-/// Empty selection means "follow the Windows default device".
-const WINDOWS_DEFAULT: &str = "";
+/// Empty selection means "follow the system default device".
+const SYSTEM_DEFAULT: &str = "";
 
 fn main() -> eframe::Result {
     let Some(show_requests) = system::single_instance() else {
@@ -103,8 +103,7 @@ impl Tray {
         }));
         show_requests.watch(move || send(Cmd::Show));
 
-        // Resource 1 is the icon build.rs embeds in the exe.
-        let icon = Icon::from_resource(1, None).map_err(|x| e(&x))?;
+        let icon = system::tray_icon()?;
         let tray = TrayIconBuilder::new()
             .with_icon(icon)
             .with_tooltip("NymPlayer")
@@ -431,7 +430,9 @@ impl eframe::App for App {
                 });
                 ui.add_space(12.0);
                 let mut on = self.autostart;
-                if ui.checkbox(&mut on, "Start with Windows and keep in the tray").changed() {
+                if let Some(label) = system::AUTOSTART_LABEL
+                    && ui.checkbox(&mut on, label).changed()
+                {
                     match system::set_autostart(on) {
                         Ok(()) => {
                             self.autostart = on;
@@ -487,7 +488,7 @@ fn level_meter(ui: &mut egui::Ui, level: f32) {
 
 fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut String, list: &[Entry]) -> bool {
     let shown = if sel.is_empty() {
-        "Windows default"
+        system::DEFAULT_DEVICE_LABEL
     } else {
         list.iter().find(|e| e.id == *sel).map_or("Saved device (not connected)", |e| e.label.as_str())
     };
@@ -496,7 +497,7 @@ fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut String, list: &[Entry]) -
         .width(240.0)
         .selected_text(shown)
         .show_ui(ui, |ui| {
-            ui.selectable_value(sel, WINDOWS_DEFAULT.to_string(), "Windows default");
+            ui.selectable_value(sel, SYSTEM_DEFAULT.to_string(), system::DEFAULT_DEVICE_LABEL);
             for e in list {
                 ui.selectable_value(sel, e.id.clone(), &e.label);
             }
@@ -774,7 +775,7 @@ fn meter(peak: f32) -> f32 {
     ((20.0 * peak.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
-/// Stored as lines in `%APPDATA%\NymPlayer\settings.txt`: input device ID, output
+/// Stored as lines in `NymPlayer\settings.txt` under `system::config_dir()` (`%APPDATA%` on Windows): input device ID, output
 /// device ID (empty = Windows default; older files hold names, see `migrate`), volume (0..1), muted (0/1), playing (0/1).
 struct Settings {
     input: String,
@@ -787,7 +788,7 @@ struct Settings {
 
 impl Settings {
     fn path() -> Option<std::path::PathBuf> {
-        Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("NymPlayer").join("settings.txt"))
+        Some(system::config_dir()?.join("NymPlayer").join("settings.txt"))
     }
 
     fn load() -> Self {

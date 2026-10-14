@@ -4,6 +4,9 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Changed
+- Windows-specific code is isolated in `src/system/`, so the app builds on macOS and Linux (untested with real audio there; no single instance, autostart or tray icon yet). CI now builds and tests on all three.
+
 ## [0.1.1] - 2026-10-14
 
 ### Added

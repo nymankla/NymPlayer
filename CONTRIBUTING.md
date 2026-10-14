@@ -8,14 +8,14 @@ By taking part you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 Open an [issue](https://github.com/nymankla/NymPlayer/issues) and include:
 
-- your Windows version
+- your operating system and version
 - the input and output devices you used (as named in the dropdowns), and whether the output was Bluetooth
 - what you heard or saw: no sound, clicks, delay, an error in the status line
 - the steps that lead to the problem
 
 ## Development setup
 
-You need Windows and the [Rust toolchain](https://rustup.rs) (MSVC).
+You need the [Rust toolchain](https://rustup.rs) (on Windows, MSVC). macOS and Linux builds work but are untested with real audio; see the readme's "macOS and Linux" section if you'd like to help.
 
 ```sh
 cargo build --release
