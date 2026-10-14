@@ -4,6 +4,8 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-14
+
 ### Added
 - Cast to Google speakers (experimental): a cast icon finds Google Home, Nest and Chromecast speakers and groups on the network (mDNS) and streams the input to the chosen one. The speaker must be allowed to connect to the PC through the firewall.
 
@@ -42,7 +44,8 @@ First release.
 - Only one copy runs at a time; starting it again brings the running copy to the front.
 - Record-player icon.
 
-[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/nymankla/NymPlayer/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/nymankla/NymPlayer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nymankla/NymPlayer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nymankla/NymPlayer/releases/tag/v0.1.0
