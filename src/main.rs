@@ -88,13 +88,11 @@ impl Tray {
         }
         let ids = [show.id().clone(), play_item.id().clone(), quit.id().clone()];
         let s = send.clone();
-        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
-            match ids.iter().position(|id| *id == ev.id) {
-                Some(0) => s(Cmd::Show),
-                Some(1) => s(Cmd::TogglePlay),
-                Some(2) => s(Cmd::Quit),
-                _ => {}
-            }
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| match ids.iter().position(|id| *id == ev.id) {
+            Some(0) => s(Cmd::Show),
+            Some(1) => s(Cmd::TogglePlay),
+            Some(2) => s(Cmd::Quit),
+            _ => {}
         }));
         let s = send.clone();
         TrayIconEvent::set_event_handler(Some(move |ev| {
@@ -286,7 +284,12 @@ impl App {
                 let fill = f32::from_bits(s.fill.load(Ordering::Relaxed)) * 1000.0 / r.in_rate as f32;
                 let (u, d) = (s.underruns.load(Ordering::Relaxed), s.dropped.load(Ordering::Relaxed));
                 let x = s.xruns.load(Ordering::Relaxed);
-                format!("{} {fill:.2} {u} {d} {x} {} {}", t.as_secs(), s.failed.load(Ordering::Relaxed) as u8, self.status)
+                format!(
+                    "{} {fill:.2} {u} {d} {x} {} {}",
+                    t.as_secs(),
+                    s.failed.load(Ordering::Relaxed) as u8,
+                    self.status
+                )
             }
             None => format!("{} - - - - - {}", t.as_secs(), self.status),
         };
@@ -309,13 +312,26 @@ impl App {
             ui.set_min_width(220.0);
             ui.label(egui::RichText::new("Cast to").strong());
             let devices = self.discovery.devices.lock().unwrap();
-            for d in devices.iter() {
-                let on = self.cast.as_ref().is_some_and(|c| c.name == d.name);
-                if ui.selectable_label(on, &d.name).clicked() && !on {
-                    pick = Some(Some(d.clone()));
+            let searching = self.discovery.searching.load(Ordering::Relaxed);
+            // Scrolls once the list would reach the bottom of the window, leaving room for
+            // the rows shown below it and the menu's margin.
+            let below = 12.0 + if searching { 26.0 } else { 0.0 } + if self.cast.is_some() { 40.0 } else { 0.0 };
+            let max = (ui.ctx().content_rect().bottom() - ui.cursor().top() - below).max(80.0);
+            // Solid bar: egui's default floating one is invisible until hovered.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::vertical().max_height(max).show(ui, |ui| {
+                for (i, d) in devices.iter().enumerate() {
+                    // Groups are sorted last; a divider separates them from the speakers.
+                    if d.group && (i == 0 || !devices[i - 1].group) {
+                        ui.separator();
+                    }
+                    let on = self.cast.as_ref().is_some_and(|c| c.name == d.name);
+                    if ui.selectable_label(on, &d.name).clicked() && !on {
+                        pick = Some(Some(d.clone()));
+                    }
                 }
-            }
-            if self.discovery.searching.load(Ordering::Relaxed) {
+            });
+            if searching {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Searching…");
@@ -367,8 +383,7 @@ impl App {
         let want = (inp.as_ref().and_then(dev_id), out_id);
         let stale = match &self.running {
             Some(r) => {
-                r.shared.failed.load(Ordering::Relaxed)
-                    || want != (Some(r.in_id.clone()), Some(r.out_id.clone()))
+                r.shared.failed.load(Ordering::Relaxed) || want != (Some(r.in_id.clone()), Some(r.out_id.clone()))
             }
             None => true,
         };
@@ -426,7 +441,13 @@ impl eframe::App for App {
             self.trace();
             self.sync();
         }
-        let wait = if first_frame { 0 } else if self.running.is_some() && !self.hidden { 33 } else { 1000 };
+        let wait = if first_frame {
+            0
+        } else if self.running.is_some() && !self.hidden {
+            33
+        } else {
+            1000
+        };
         ctx.request_repaint_after(Duration::from_millis(wait));
     }
 
@@ -444,90 +465,88 @@ impl eframe::App for App {
         let mut toggle = false;
         let mut cast_change = None;
         let live = self.running.is_some();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    spinning_record(ui, live);
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("NymPlayer").size(24.0).strong().color(egui::Color32::WHITE));
-                        ui.label(egui::RichText::new("USB input to any output").color(WOOD));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        cast_change = self.cast_menu(ui);
-                    });
+        egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                spinning_record(ui, live);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("NymPlayer").size(24.0).strong().color(egui::Color32::WHITE));
+                    ui.label(egui::RichText::new("Any input to any output").color(WOOD));
                 });
-                ui.add_space(4.0);
-                egui::Frame::new().fill(SURFACE).corner_radius(10).inner_margin(12.0).show(ui, |ui| {
-                    egui::Grid::new("devices").num_columns(3).spacing([12.0, 10.0]).show(ui, |ui| {
-                        let s = &mut self.settings;
-                        ui.label("Input");
-                        changed |= device_combo(ui, "in", &mut s.input, &self.inputs);
-                        level_meter(ui, meter(self.in_level));
-                        ui.end_row();
-                        ui.label("Output");
-                        match &self.cast {
-                            Some(c) => {
-                                ui.label(egui::RichText::new(format!("Casting to {}", c.name)).color(ACCENT));
-                            }
-                            None => changed |= device_combo(ui, "out", &mut s.output, &self.outputs),
-                        }
-                        level_meter(ui, meter(self.out_level));
-                        ui.end_row();
-                        ui.label("Volume");
-                        ui.spacing_mut().slider_width = 180.0;
-                        let slider = egui::Slider::new(&mut s.volume, 0.0..=1.0)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
-                        let r = ui.add_enabled(!s.muted, slider);
-                        let mute = ui.selectable_label(s.muted, if s.muted { "Muted" } else { "Mute" });
-                        if mute.clicked() {
-                            s.muted = !s.muted;
-                        }
-                        if r.changed() || mute.clicked() {
-                            self.update_gain();
-                        }
-                        // Save once a drag ends rather than on every frame of it.
-                        volume_done = r.drag_stopped() || (r.changed() && !r.dragged()) || mute.clicked();
-                        ui.end_row();
-                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    cast_change = self.cast_menu(ui);
                 });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let (label, fill) = if self.settings.playing {
-                        ("⏹  Stop", egui::Color32::from_rgb(70, 70, 80))
-                    } else {
-                        ("▶  Play", ACCENT)
-                    };
-                    let text = egui::RichText::new(label).size(18.0).strong().color(egui::Color32::WHITE);
-                    let button = egui::Button::new(text).fill(fill).corner_radius(18).min_size(egui::vec2(120.0, 36.0));
-                    toggle = ui.add(button).clicked();
-                    let dot = if live {
-                        GREEN
-                    } else if self.status.starts_with("Error") {
-                        ACCENT
-                    } else if self.settings.playing {
-                        AMBER
-                    } else {
-                        egui::Color32::GRAY
-                    };
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 5.0, dot);
-                    ui.add(egui::Label::new(&self.status).truncate());
-                });
-                ui.add_space(12.0);
-                let mut on = self.autostart;
-                if let Some(label) = system::AUTOSTART_LABEL
-                    && ui.checkbox(&mut on, label).changed()
-                {
-                    match system::set_autostart(on) {
-                        Ok(()) => {
-                            self.autostart = on;
-                            self.show_tray_icon(on);
-                        }
-                        Err(e) => self.status = format!("Error: {e}"),
-                    }
-                }
             });
+            ui.add_space(4.0);
+            egui::Frame::new().fill(SURFACE).corner_radius(10).inner_margin(12.0).show(ui, |ui| {
+                egui::Grid::new("devices").num_columns(3).spacing([12.0, 10.0]).show(ui, |ui| {
+                    let s = &mut self.settings;
+                    ui.label("Input");
+                    changed |= device_combo(ui, "in", &mut s.input, &self.inputs);
+                    level_meter(ui, meter(self.in_level));
+                    ui.end_row();
+                    ui.label("Output");
+                    match &self.cast {
+                        Some(c) => {
+                            ui.label(egui::RichText::new(format!("Casting to {}", c.name)).color(ACCENT));
+                        }
+                        None => changed |= device_combo(ui, "out", &mut s.output, &self.outputs),
+                    }
+                    level_meter(ui, meter(self.out_level));
+                    ui.end_row();
+                    ui.label("Volume");
+                    ui.spacing_mut().slider_width = 180.0;
+                    let slider = egui::Slider::new(&mut s.volume, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
+                    let r = ui.add_enabled(!s.muted, slider);
+                    let mute = ui.selectable_label(s.muted, if s.muted { "Muted" } else { "Mute" });
+                    if mute.clicked() {
+                        s.muted = !s.muted;
+                    }
+                    if r.changed() || mute.clicked() {
+                        self.update_gain();
+                    }
+                    // Save once a drag ends rather than on every frame of it.
+                    volume_done = r.drag_stopped() || (r.changed() && !r.dragged()) || mute.clicked();
+                    ui.end_row();
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let (label, fill) = if self.settings.playing {
+                    ("⏹  Stop", egui::Color32::from_rgb(70, 70, 80))
+                } else {
+                    ("▶  Play", ACCENT)
+                };
+                let text = egui::RichText::new(label).size(18.0).strong().color(egui::Color32::WHITE);
+                let button = egui::Button::new(text).fill(fill).corner_radius(18).min_size(egui::vec2(120.0, 36.0));
+                toggle = ui.add(button).clicked();
+                let dot = if live {
+                    GREEN
+                } else if self.status.starts_with("Error") {
+                    ACCENT
+                } else if self.settings.playing {
+                    AMBER
+                } else {
+                    egui::Color32::GRAY
+                };
+                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 5.0, dot);
+                ui.add(egui::Label::new(&self.status).truncate());
+            });
+            ui.add_space(12.0);
+            let mut on = self.autostart;
+            if let Some(label) = system::AUTOSTART_LABEL
+                && ui.checkbox(&mut on, label).changed()
+            {
+                match system::set_autostart(on) {
+                    Ok(()) => {
+                        self.autostart = on;
+                        self.show_tray_icon(on);
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+        });
 
         if toggle {
             self.set_playing(!self.settings.playing);
@@ -608,9 +627,16 @@ fn level_meter(ui: &mut egui::Ui, level: f32) {
     let w = rect.width() / SEGMENTS as f32;
     for i in 0..SEGMENTS {
         let pos = i as f32 / SEGMENTS as f32;
-        let color = if pos < 0.65 { GREEN } else if pos < 0.85 { AMBER } else { ACCENT };
+        let color = if pos < 0.65 {
+            GREEN
+        } else if pos < 0.85 {
+            AMBER
+        } else {
+            ACCENT
+        };
         let lit = pos < level;
-        let seg = egui::Rect::from_min_size(rect.min + egui::vec2(i as f32 * w, 0.0), egui::vec2(w - 2.0, rect.height()));
+        let seg =
+            egui::Rect::from_min_size(rect.min + egui::vec2(i as f32 * w, 0.0), egui::vec2(w - 2.0, rect.height()));
         ui.painter().rect_filled(seg, 2, if lit { color } else { color.gamma_multiply(0.15) });
     }
 }
@@ -622,15 +648,12 @@ fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut String, list: &[Entry]) -
         list.iter().find(|e| e.id == *sel).map_or("Saved device (not connected)", |e| e.label.as_str())
     };
     let before = sel.clone();
-    egui::ComboBox::from_id_salt(id)
-        .width(240.0)
-        .selected_text(shown)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(sel, SYSTEM_DEFAULT.to_string(), system::DEFAULT_DEVICE_LABEL);
-            for e in list {
-                ui.selectable_value(sel, e.id.clone(), &e.label);
-            }
-        });
+    egui::ComboBox::from_id_salt(id).width(240.0).selected_text(shown).show_ui(ui, |ui| {
+        ui.selectable_value(sel, SYSTEM_DEFAULT.to_string(), system::DEFAULT_DEVICE_LABEL);
+        for e in list {
+            ui.selectable_value(sel, e.id.clone(), &e.label);
+        }
+    });
     *sel != before
 }
 
@@ -770,22 +793,22 @@ fn build_output(
     let mut converter = Converter::new(ich, ocfg.sample_rate() as f64 / in_rate as f64, target)?;
     let s = shared.clone();
     out.build_output_stream(
-            ocfg.config(),
-            move |data: &mut [f32], _: &_| {
-                let primed = converter.primed;
-                converter.fill(data, och, &mut cons);
-                if primed && !converter.primed {
-                    s.underruns.fetch_add(1, Ordering::Relaxed);
-                }
-                s.fill.store((converter.fill as f32).to_bits(), Ordering::Relaxed);
-                let g = f32::from_bits(gain.load(Ordering::Relaxed));
-                data.iter_mut().for_each(|x| *x *= g);
-                s.out_peak.fetch_max(peak(data).to_bits(), Ordering::Relaxed);
-            },
-            fail(shared),
-            None,
-        )
-        .map_err(e)
+        ocfg.config(),
+        move |data: &mut [f32], _: &_| {
+            let primed = converter.primed;
+            converter.fill(data, och, &mut cons);
+            if primed && !converter.primed {
+                s.underruns.fetch_add(1, Ordering::Relaxed);
+            }
+            s.fill.store((converter.fill as f32).to_bits(), Ordering::Relaxed);
+            let g = f32::from_bits(gain.load(Ordering::Relaxed));
+            data.iter_mut().for_each(|x| *x *= g);
+            s.out_peak.fetch_max(peak(data).to_bits(), Ordering::Relaxed);
+        },
+        fail(shared),
+        None,
+    )
+    .map_err(e)
 }
 
 /// Error callback: marks the streams for a restart, except for errors cpal reports while
@@ -864,8 +887,8 @@ impl Converter {
         let params = SincInterpolationParameters::new(64, WindowFunction::BlackmanHarris2)
             .oversampling_factor(128)
             .interpolation(SincInterpolationType::Linear);
-        let rs = Async::<f32>::new_sinc(ratio, 1.01, &params, CHUNK, ich, FixedAsync::Output)
-            .map_err(|e| e.to_string())?;
+        let rs =
+            Async::<f32>::new_sinc(ratio, 1.01, &params, CHUNK, ich, FixedAsync::Output).map_err(|e| e.to_string())?;
         let scratch = vec![0.0; rs.input_frames_max() * ich];
         let pending = vec![0.0; rs.output_frames_max() * ich];
         let pos = pending.len();

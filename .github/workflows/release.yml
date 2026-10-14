@@ -31,7 +31,7 @@ jobs:
           fi
 
       - run: cargo test
-      - run: cargo build --release
+      - run: cargo build --profile dist
 
       - name: Create release
         shell: bash
@@ -39,5 +39,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           asset="NymPlayer-$GITHUB_REF_NAME-windows-x64.exe"
-          cp target/release/nymplayer.exe "$asset"
+          cp target/dist/nymplayer.exe "$asset"
           gh release create "$GITHUB_REF_NAME" "$asset" --title "NymPlayer $GITHUB_REF_NAME" --generate-notes

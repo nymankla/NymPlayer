@@ -1,6 +1,6 @@
 //! Casting to Google Cast speakers (Google Home, Nest, Chromecast). Experimental.
 //!
-//! - Discovery: mDNS (`_googlecast._tcp`) via `oxicast`.
+//! - Discovery: mDNS (`_googlecast._tcp`) via `mdns-sd`; speaker groups included.
 //! - Audio: a Cast speaker plays media from a URL, so `Session` runs a small HTTP server
 //!   that streams the live input as endless 16-bit stereo WAV, and tells the speaker (via
 //!   `oxicast`, Default Media Receiver) to play that URL. The speaker connects back to this
@@ -24,6 +24,8 @@ pub struct Device {
     pub name: String,
     pub ip: IpAddr,
     pub port: u16,
+    /// A speaker group set up in the Google Home app.
+    pub group: bool,
 }
 
 impl Device {
@@ -45,6 +47,13 @@ const SEARCH: Duration = Duration::from_secs(4);
 /// Without a request from the speaker by then, something (usually the firewall) blocks it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 64 unpredictable bits from the standard library's randomly keyed hasher, so no crate
+/// is needed.
+fn secret() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
 fn block_on<F: Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime").block_on(f)
 }
@@ -57,22 +66,44 @@ impl Discovery {
         }
         let this = self.clone();
         std::thread::spawn(move || {
-            block_on(async {
-                if let Ok(mut found) = oxicast::discovery::discover(SEARCH) {
-                    while let Some(d) = found.recv().await {
-                        let mut list = this.devices.lock().unwrap();
-                        if !list.iter().any(|x| x.name == d.name) {
-                            list.push(Device { name: d.name, ip: d.ip, port: d.port });
-                            list.sort_by(|a, b| a.name.cmp(&b.name));
+            // Our own browse, not oxicast's: that one skips answers from an IP it has already
+            // seen, and a speaker group is advertised at one of its speakers' IPs (on another
+            // port), so either the group or that speaker went missing.
+            if let Ok(mdns) = mdns_sd::ServiceDaemon::new()
+                && let Ok(found) = mdns.browse("_googlecast._tcp.local.")
+            {
+                let deadline = Instant::now() + SEARCH;
+                while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                    let Ok(event) = found.recv_timeout(left) else { break };
+                    if let mdns_sd::ServiceEvent::ServiceResolved(info) = event
+                        && let Some(ip) = info.get_addresses_v4().iter().next()
+                    {
+                        // "fn" is the friendly name people gave the speaker or group.
+                        let name = info.get_property_val_str("fn").unwrap_or(info.get_fullname()).to_string();
+                        let group = info.get_property_val_str("md") == Some("Google Cast Group");
+                        let dev = Device { name, ip: IpAddr::V4(*ip), port: info.get_port(), group };
+                        if add(&mut this.devices.lock().unwrap(), dev) {
                             changed();
                         }
                     }
                 }
-            });
+                let _ = mdns.shutdown();
+            }
             this.searching.store(false, Ordering::Relaxed);
             changed();
         });
     }
+}
+
+/// Adds a newly found device unless one with that name is listed; keeps the list sorted,
+/// speakers first, then groups.
+fn add(list: &mut Vec<Device>, dev: Device) -> bool {
+    if list.iter().any(|x| x.name == dev.name) {
+        return false;
+    }
+    list.push(dev);
+    list.sort_by(|a, b| (a.group, &a.name).cmp(&(b.group, &b.name)));
+    true
 }
 
 /// A running cast. Dropping it stops the stream and the speaker's playback.
@@ -97,13 +128,15 @@ impl Session {
         udp.connect((dev.ip, dev.port)).map_err(e)?;
         let listener = TcpListener::bind((udp.local_addr().map_err(e)?.ip(), 0)).map_err(e)?;
         listener.set_nonblocking(true).map_err(e)?;
-        let url = format!("http://{}/nymplayer.wav", listener.local_addr().map_err(e)?);
+        // A secret path, so other devices on the network can't listen in or take the stream over.
+        let path = format!("/nymplayer-{:016x}.wav", secret());
+        let url = format!("http://{}{path}", listener.local_addr().map_err(e)?);
 
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
         let fetched = Arc::new(AtomicBool::new(false));
         let (s, f) = (stop.clone(), fetched.clone());
-        std::thread::spawn(move || serve(listener, rate, ich, cons, gain, shared, s, f));
+        std::thread::spawn(move || serve(listener, &path, rate, ich, cons, gain, shared, s, f));
 
         let (dev, s, end) = (dev.clone(), stop.clone(), ended.clone());
         std::thread::spawn(move || {
@@ -174,11 +207,13 @@ async fn control(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBoo
     reason
 }
 
-/// The HTTP side: answers each request from the speaker with an endless WAV stream of
-/// the live input. A new request takes over from the previous one.
+/// The HTTP side: answers each request for `path` with an endless WAV stream of the live
+/// input. A new request takes over from the previous one.
+// shortcut: no drift correction between the input clock and the speaker's; its buffer absorbs it, add rate matching if long casts glitch.
 #[allow(clippy::too_many_arguments)]
 fn serve(
     listener: TcpListener,
+    path: &str,
     rate: u32,
     ich: usize,
     mut cons: HeapCons<f32>,
@@ -191,12 +226,14 @@ fn serve(
     let mut samples = vec![0.0f32; 4096 * ich];
     let mut bytes = Vec::with_capacity(4096 * 4);
     while !stop.load(Ordering::Relaxed) {
-        if let Ok((c, _)) = listener.accept() {
-            // Both before responding: once the client has the headers, it may already be
+        if let Ok((c, _)) = listener.accept()
+            && let Ok(c) = read_request(c, path)
+        {
+            // Both before the headers go out: once the client has them, it may already be
             // waiting for audio pushed after them.
             fetched.store(true, Ordering::Relaxed);
             cons.clear(); // start from live audio, not what piled up while waiting
-            conn = respond(c, rate).ok();
+            conn = send_headers(c, rate).ok();
         }
         let n = cons.pop_slice(&mut samples);
         let Some(c) = conn.as_mut().filter(|_| n > 0) else {
@@ -221,16 +258,24 @@ fn serve(
     }
 }
 
-/// Reads the request (contents don't matter) and sends the headers of the endless WAV.
-fn respond(mut c: TcpStream, rate: u32) -> std::io::Result<TcpStream> {
+/// Reads the request and accepts it only if it's for `path` (dropping `c` otherwise).
+fn read_request(mut c: TcpStream, path: &str) -> std::io::Result<TcpStream> {
     c.set_nonblocking(false)?;
     c.set_read_timeout(Some(Duration::from_secs(2)))?;
+    // A speaker that stops reading would otherwise block the stream thread forever.
+    c.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut req = [0u8; 4096];
-    match c.read(&mut req) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-        Err(e) => return Err(e),
+    let n = c.read(&mut req)?;
+    // Request line: "GET <path> HTTP/1.1".
+    let target = std::str::from_utf8(&req[..n]).ok().and_then(|r| r.split(' ').nth(1));
+    if target != Some(path) {
+        return Err(ErrorKind::NotFound.into());
     }
+    Ok(c)
+}
+
+/// Sends the headers of the endless WAV stream.
+fn send_headers(mut c: TcpStream, rate: u32) -> std::io::Result<TcpStream> {
     c.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
     c.write_all(&wav_header(rate, 2))?;
     Ok(c)
@@ -263,6 +308,19 @@ mod tests {
     use ringbuf::traits::{Producer, Split};
 
     #[test]
+    fn group_and_its_host_speaker_are_both_listed() {
+        let at =
+            |name: &str, port| Device { name: name.into(), ip: [192, 168, 1, 122].into(), port, group: port != 8009 };
+        let mut list = vec![];
+        assert!(add(&mut list, at("Matrum", 8009)));
+        assert!(add(&mut list, at("Kök Och Matrum", 32109))); // a group at the same IP, other port
+        assert!(add(&mut list, at("Bibliotek", 8009)));
+        assert!(!add(&mut list, at("Matrum", 8009))); // repeated answer
+        let names: Vec<_> = list.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Bibliotek", "Matrum", "Kök Och Matrum"]); // groups last
+    }
+
+    #[test]
     fn wav_header_layout() {
         let h = wav_header(48000, 2);
         assert_eq!(h.len(), 44);
@@ -283,11 +341,18 @@ mod tests {
         let gain = Arc::new(AtomicU32::new(0.5f32.to_bits()));
         let (stop, fetched) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let (s, f) = (stop.clone(), fetched.clone());
-        let server = std::thread::spawn(move || serve(listener, 44100, 1, cons, gain, Arc::default(), s, f));
+        let server = std::thread::spawn(move || serve(listener, "/s.wav", 44100, 1, cons, gain, Arc::default(), s, f));
+
+        // Someone guessing the port but not the secret path gets nothing.
+        let mut other = TcpStream::connect(addr).unwrap();
+        other.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        other.write_all(b"GET /nymplayer.wav HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(other.read(&mut [0u8; 16]).unwrap_or(0), 0);
+        assert!(!fetched.load(Ordering::Relaxed));
 
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); // fail rather than hang
-        c.write_all(b"GET /nymplayer.wav HTTP/1.1\r\n\r\n").unwrap();
+        c.write_all(b"GET /s.wav HTTP/1.1\r\n\r\n").unwrap();
         let mut head = vec![0u8; 4096];
         let mut got = 0;
         // Headers and the WAV header arrive first; audio pushed after that is streamed.

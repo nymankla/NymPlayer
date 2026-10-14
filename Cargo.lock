@@ -2336,6 +2336,7 @@ version = "0.2.0"
 dependencies = [
  "cpal",
  "eframe",
+ "mdns-sd",
  "oxicast",
  "ringbuf",
  "rubato",
@@ -2726,7 +2727,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "833e4fddd5451e25ff2586c32fe6741b4f77e4e97764390e4d4b66ca2828d856"
 dependencies = [
  "bytes",
- "mdns-sd",
  "prost",
  "rustls",
  "rustls-native-certs",

@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/nymankla/NymPlayer)](https://github.com/nymankla/NymPlayer/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-A small Windows app that plays live audio from an input device, such as a USB audio interface or line-in, through any output device, such as speakers or Bluetooth headphones.
+A small Windows app that plays live audio from an input device, such as a USB audio interface or line-in, through any output device, such as speakers, Bluetooth headphones or Cast to Google Home speakers.
 
 **[⬇ Download the latest version](https://github.com/nymankla/NymPlayer/releases/latest)**: a single `.exe`, no installer.
 

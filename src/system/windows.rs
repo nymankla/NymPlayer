@@ -47,10 +47,12 @@ impl ShowRequests {
         if self.0 == 0 {
             return;
         }
-        std::thread::spawn(move || loop {
-            // SAFETY: the handle stays open for the life of the process.
-            unsafe { WaitForSingleObject(self.0 as HANDLE, INFINITE) };
-            on_show();
+        std::thread::spawn(move || {
+            loop {
+                // SAFETY: the handle stays open for the life of the process.
+                unsafe { WaitForSingleObject(self.0 as HANDLE, INFINITE) };
+                on_show();
+            }
         });
     }
 }
@@ -92,7 +94,11 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
         }
     };
     // Removing an entry that isn't there is fine: it's already off.
-    if err == ERROR_SUCCESS || (!on && err == ERROR_FILE_NOT_FOUND) { Ok(()) } else { Err(format!("registry error {err}")) }
+    if err == ERROR_SUCCESS || (!on && err == ERROR_FILE_NOT_FOUND) {
+        Ok(())
+    } else {
+        Err(format!("registry error {err}"))
+    }
 }
 
 /// The tray icon: resource 1, the icon build.rs embeds in the exe.

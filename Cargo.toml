@@ -7,8 +7,9 @@ license = "MIT"
 [dependencies]
 cpal = "0.18.2"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+mdns-sd = "0.19"
 ringbuf = "0.5.3"
-oxicast = "0.0.3"
+oxicast = { version = "0.0.3", default-features = false }
 rubato = "5.0.1"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 tray-icon = "0.26.1"
@@ -18,3 +19,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [build-dependencies]
 winresource = "0.1.34"
+
+# Published builds (release workflow): link-time optimization makes the exe about 20%
+# smaller but the build ~2 min slower, so everyday `--release` builds skip it.
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1

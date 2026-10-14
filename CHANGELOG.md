@@ -4,6 +4,15 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Changed
+- The cast menu lists speakers first, then speaker groups after a divider, and scrolls when it doesn't fit the window.
+- Published downloads are built with link-time optimization: about 20% smaller.
+
+### Fixed
+- Casting: the stream address now contains a random secret, so other devices on the network can't listen in or take the stream over.
+- Casting: a speaker that stops reading (e.g. a Wi-Fi dropout) can no longer freeze the stream; it times out after 5 seconds.
+- Speaker groups (and the speaker hosting a group) were often missing from the cast menu: a group is announced at one of its speakers' addresses, and only the first answer from each address was kept.
+
 ## [0.2.0] - 2026-10-14
 
 ### Added

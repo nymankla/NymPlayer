@@ -10,8 +10,11 @@ NymPlayer is a Rust desktop app, released for Windows only (it builds on macOS a
 
 ```sh
 cargo build --release          # binary: target/release/nymplayer.exe
+cargo build --profile dist     # as published: + LTO, ~20% smaller, slower build (target/dist/)
 cargo test                     # unit tests (converter, settings parsing, meter scale)
 cargo test resamples_48k       # run a single test by name filter
+cargo fmt                      # format (rustfmt.toml: 120 columns)
+cargo clippy --all-targets     # lint; keep it warning-free
 python assets/make_icon.py     # regenerate assets/icon.png + icon.ico (stdlib only)
 ```
 
@@ -40,8 +43,8 @@ Audio path, in `start()`:
 - Diagnostics: run with `NYMPLAYER_TRACE=<file>` and `App::trace` appends one line per second (unix time, buffer fill in ms, underruns, dropped input frames, xruns, failed, status), from counters in `Shared`. Counters reset when the streams restart.
 
 Casting (`src/cast.rs`, experimental), an alternative to the local output device (`enum Output` in `start()`):
-- **Discovery:** `cast::Discovery::search` runs `oxicast`'s mDNS browse (`_googlecast._tcp`) on a background thread when the cast icon is clicked, filling a shared list.
-- **Session:** `cast::Session::start` serves the live input as endless 16-bit stereo WAV over a small `std` HTTP server (bound to the local address that routes to the speaker), then a control thread uses `oxicast` to launch the Default Media Receiver and load that URL as a live stream. The ring buffer holds 2 s for casting. A new HTTP request takes over and clears stale audio.
+- **Discovery:** `cast::Discovery::search` browses mDNS (`_googlecast._tcp`) with `mdns-sd` directly on a background thread when the cast icon is clicked, filling a shared list (unique by name). Not `oxicast::discovery`: it drops answers from an already-seen IP, and a speaker group is advertised at one of its speakers' IPs, so groups went missing.
+- **Session:** `cast::Session::start` serves the live input as endless 16-bit stereo WAV over a small `std` HTTP server (bound to the local address that routes to the speaker), then a control thread uses `oxicast` to launch the Default Media Receiver and load that URL as a live stream. The ring buffer holds 2 s for casting. Only requests for the session's random secret path are served (`secret()`, the std hasher's random keys), so other LAN devices can't listen or take over; a new valid request takes over and clears stale audio. Writes time out after 5 s, so a stalled speaker can't block the thread.
 - **Threads:** `oxicast` is async; each discovery and each session runs a current-thread tokio runtime on its own thread. The GUI and audio code stay synchronous.
 - **Ending:** dropping `Session` stops the stream and the speaker app. If the speaker ends the session, or never fetches the stream within 10 s (usually the firewall), `Session::ended` returns a reason; `sync()` then stops playback rather than switching to the local output.
 - The speaker must open an incoming connection to this PC, so a firewall that blocks inbound traffic (e.g. company policy) makes casting impossible. Live WAV casting is confirmed working on a real Google speaker (a few seconds of buffering, set by the receiver); the streaming is also covered by the loopback test `serves_live_wav_over_http`.
