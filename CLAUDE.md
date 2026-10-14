@@ -77,7 +77,7 @@ GUI notes:
 
 ## Platform code
 
-All OS-specific code lives under `src/system/`. `src/system.rs` picks `windows.rs` or `other.rs` (macOS/Linux fallbacks: no single instance, autostart or tray icon) and its doc comment lists the API every platform file provides. `main.rs` only calls `system::*` and must stay platform-neutral (its `#![windows_subsystem]` attribute is the one exception; other targets ignore it). CI builds and tests on Windows, macOS and Linux; releases are Windows-only.
+All OS-specific code lives under `src/system/`. `src/system.rs` picks `windows.rs` or `other.rs` (macOS/Linux fallbacks: no single instance, autostart or tray icon) and its doc comment lists the API every platform file provides. `main.rs` only calls `system::*` and must stay platform-neutral (its `#![windows_subsystem]` attribute is the one exception; other targets ignore it). CI builds and tests on Windows, macOS and Linux, but only for `v*` tags or when started by hand (Actions tab, "Run workflow"), not on every push; releases are Windows-only. So check macOS/Linux builds by running CI by hand before tagging when platform code changed.
 
 **Warn the user whenever a change would put OS-specific code outside `src/system/`**, then move it behind the `system` API instead. Signs of creep:
 - `#[cfg(windows)]`, `cfg!(target_os = ...)`, `windows-sys`/Win32 calls, or Windows-only crate APIs such as `Icon::from_resource`

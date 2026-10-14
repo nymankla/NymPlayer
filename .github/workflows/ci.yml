@@ -1,9 +1,11 @@
 name: CI
 
+# Only on version tags (alongside the release workflow), or started by hand from the
+# Actions tab; plain pushes and pull requests don't build.
 on:
   push:
-    branches: [master]
-  pull_request:
+    tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
