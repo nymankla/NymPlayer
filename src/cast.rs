@@ -44,6 +44,9 @@ pub struct Discovery {
 
 /// How long a search listens; speakers usually answer within half a second.
 const SEARCH: Duration = Duration::from_secs(4);
+/// After this long without input, silence is sent instead, so the speaker doesn't run dry
+/// and give up (loopback input sends nothing while the PC is quiet).
+const GAP: Duration = Duration::from_millis(100);
 /// Without a request from the speaker by then, something (usually the firewall) blocks it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -225,6 +228,7 @@ fn serve(
     let mut conn: Option<TcpStream> = None;
     let mut samples = vec![0.0f32; 4096 * ich];
     let mut bytes = Vec::with_capacity(4096 * 4);
+    let mut heard = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if let Ok((c, _)) = listener.accept()
             && let Ok(c) = read_request(c, path)
@@ -235,7 +239,14 @@ fn serve(
             cons.clear(); // start from live audio, not what piled up while waiting
             conn = send_headers(c, rate).ok();
         }
-        let n = cons.pop_slice(&mut samples);
+        let mut n = cons.pop_slice(&mut samples);
+        if n > 0 {
+            heard = Instant::now();
+        } else if conn.is_some() && heard.elapsed() >= GAP {
+            n = (rate as usize * GAP.as_millis() as usize / 1000 * ich).min(samples.len());
+            samples[..n].fill(0.0);
+            heard = Instant::now();
+        }
         let Some(c) = conn.as_mut().filter(|_| n > 0) else {
             std::thread::sleep(Duration::from_millis(5));
             continue;
@@ -320,6 +331,33 @@ mod tests {
         assert_eq!(names, ["Bibliotek", "Matrum", "Kök Och Matrum"]); // groups last
     }
 
+    /// With no input at all, the speaker still gets (silent) audio after `GAP`.
+    #[test]
+    fn sends_silence_while_the_input_is_quiet() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_prod, cons) = HeapRb::<f32>::new(1024).split();
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let (stop, fetched) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let s = stop.clone();
+        let server =
+            std::thread::spawn(move || serve(listener, "/s.wav", 8000, 1, cons, gain, Arc::default(), s, fetched));
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"GET /s.wav HTTP/1.1\r\n\r\n").unwrap();
+        let mut got: Vec<u8> = vec![];
+        // Headers (~100 bytes) + WAV header (44) + 100 ms of 8 kHz stereo silence (3200).
+        while got.len() < 3000 {
+            let mut b = [0u8; 4096];
+            let n = c.read(&mut b).unwrap();
+            got.extend(&b[..n]);
+        }
+        assert!(got[got.len() - 1000..].iter().all(|&b| b == 0));
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
     #[test]
     fn wav_header_layout() {
         let h = wav_header(48000, 2);
@@ -368,6 +406,10 @@ mod tests {
             let mut b = [0u8; 64];
             let n = c.read(&mut b).unwrap();
             audio.extend(&b[..n]);
+            // A slow machine may get silence (sent after `GAP`) before the pushed audio.
+            while audio.len() >= 4 && audio[..4] == [0; 4] {
+                audio.drain(..4);
+            }
         }
         let s: Vec<i16> = audio[..8].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
         assert_eq!(s, [16383, 16383, -16383, -16383]);

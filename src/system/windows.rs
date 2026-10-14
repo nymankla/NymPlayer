@@ -11,6 +11,8 @@ use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, Wa
 use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 
 pub const DEFAULT_DEVICE_LABEL: &str = "Windows default";
+/// Output devices can be recorded (WASAPI loopback), so they're offered as inputs too.
+pub const LOOPBACK: bool = true;
 pub const AUTOSTART_LABEL: Option<&str> = Some("Start with Windows and keep in the tray");
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";

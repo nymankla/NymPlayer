@@ -4,7 +4,13 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+### Added
+- Play what the PC plays (loopback): output devices are offered as inputs ("What plays on …"), e.g. to cast the PC's music to Google speakers. Looping a device back into itself is refused, as it would echo endlessly. While casting, gaps in the input are filled with silence, so the speaker keeps playing when the PC goes quiet.
+
 ### Changed
+- Long device names are cut short with "…", so the dropdowns stay inside the window.
 - The cast menu lists speakers first, then speaker groups after a divider, and scrolls when it doesn't fit the window.
 - Published downloads are built with link-time optimization: about 20% smaller.
 
@@ -53,7 +59,8 @@ First release.
 - Only one copy runs at a time; starting it again brings the running copy to the front.
 - Record-player icon.
 
-[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nymankla/NymPlayer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nymankla/NymPlayer/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/nymankla/NymPlayer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nymankla/NymPlayer/compare/v0.1.0...v0.1.1

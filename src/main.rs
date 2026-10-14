@@ -21,6 +21,9 @@ mod system;
 
 /// Empty selection means "follow the system default device".
 const SYSTEM_DEFAULT: &str = "";
+/// Input selection prefix for an output device's loopback (what the PC plays through it),
+/// followed by that output device's ID.
+const LOOPBACK: &str = "loopback:";
 
 fn main() -> eframe::Result {
     let Some(show_requests) = system::single_instance() else {
@@ -352,6 +355,14 @@ impl App {
     fn refresh_devices(&mut self) {
         self.inputs = self.host.input_devices().map(entries).unwrap_or_default();
         self.outputs = self.host.output_devices().map(entries).unwrap_or_default();
+        if system::LOOPBACK {
+            self.inputs.extend(self.outputs.iter().map(|e| Entry {
+                id: format!("{LOOPBACK}{}", e.id),
+                name: e.name.clone(),
+                // Meaning first, so it survives when a long name is cut short.
+                label: format!("What plays on {}", e.label),
+            }));
+        }
         let s = &mut self.settings;
         if migrate(&mut s.input, &self.inputs) | migrate(&mut s.output, &self.outputs) {
             s.save();
@@ -374,13 +385,24 @@ impl App {
             return;
         }
         let s = &self.settings;
-        let inp = pick(self.host.input_devices().ok(), self.host.default_input_device(), &s.input);
+        let inp = match s.input.strip_prefix(LOOPBACK) {
+            // No fallback: switching to the microphone instead would be a surprise.
+            Some(id) => pick(self.host.output_devices().ok(), None, id),
+            None => pick(self.host.input_devices().ok(), self.host.default_input_device(), &s.input),
+        };
         let out = pick(self.host.output_devices().ok(), self.host.default_output_device(), &s.output);
         let out_id = match &self.cast {
             Some(c) => Some(c.id()),
             None => out.as_ref().and_then(dev_id),
         };
         let want = (inp.as_ref().and_then(dev_id), out_id);
+        if loops_back(&self.settings.input, want.1.as_deref()) {
+            self.running = None;
+            self.status =
+                "Error: can't play what the PC plays back through the same speakers; choose another output or cast"
+                    .into();
+            return;
+        }
         let stale = match &self.running {
             Some(r) => {
                 r.shared.failed.load(Ordering::Relaxed) || want != (Some(r.in_id.clone()), Some(r.out_id.clone()))
@@ -468,10 +490,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 spinning_record(ui, live);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("NymPlayer").size(24.0).strong().color(egui::Color32::WHITE));
-                    ui.label(egui::RichText::new("Any input to any output").color(WOOD));
-                });
+                ui.label(egui::RichText::new("NymPlayer").size(24.0).strong().color(egui::Color32::WHITE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     cast_change = self.cast_menu(ui);
                 });
@@ -648,7 +667,10 @@ fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut String, list: &[Entry]) -
         list.iter().find(|e| e.id == *sel).map_or("Saved device (not connected)", |e| e.label.as_str())
     };
     let before = sel.clone();
-    egui::ComboBox::from_id_salt(id).width(240.0).selected_text(shown).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).width(240.0).truncate().selected_text(shown).show_ui(ui, |ui| {
+        // Long device names would otherwise run past the window.
+        ui.set_max_width(380.0);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.selectable_value(sel, SYSTEM_DEFAULT.to_string(), system::DEFAULT_DEVICE_LABEL);
         for e in list {
             ui.selectable_value(sel, e.id.clone(), &e.label);
@@ -707,6 +729,12 @@ fn migrate(sel: &mut String, list: &[Entry]) -> bool {
     }
 }
 
+/// Whether `input` captures the very output it would play to, which would echo endlessly.
+/// `out_id` is the output's device ID (a cast target's never matches).
+fn loops_back(input: &str, out_id: Option<&str>) -> bool {
+    input.strip_prefix(LOOPBACK).is_some_and(|id| out_id == Some(id))
+}
+
 /// The selected device (by ID) if present, otherwise the Windows default.
 fn pick(
     devs: Option<impl Iterator<Item = cpal::Device>>,
@@ -727,7 +755,8 @@ enum Output<'a> {
 
 fn start(inp: &cpal::Device, out: Output, gain: Arc<AtomicU32>) -> Result<Running, String> {
     let e = |e: cpal::Error| e.to_string();
-    let icfg = inp.default_input_config().map_err(e)?;
+    // An output device here is a loopback input; it only has an output format.
+    let icfg = inp.default_input_config().or_else(|_| inp.default_output_config()).map_err(e)?;
     let ich = icfg.channels() as usize;
     let in_rate = icfg.sample_rate();
     let frames = match out {
@@ -1074,6 +1103,16 @@ mod tests {
         let mut out = [0.0; 100];
         assert!(!Converter::new(1, 1.0, 32).unwrap().fill(&mut out, 1, &mut buffer(&[0.5; 10])));
         assert!(out.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn loopback_into_the_same_output_is_refused() {
+        let spk = "wasapi:{0.0.0.00000000}.{abc}";
+        let looped = format!("{LOOPBACK}{spk}");
+        assert!(loops_back(&looped, Some(spk)));
+        assert!(!loops_back(&looped, Some("wasapi:{0.0.0.00000000}.{other}")));
+        assert!(!loops_back(&looped, Some("cast:Bibliotek")));
+        assert!(!loops_back(spk, Some(spk))); // a microphone-style input, not loopback
     }
 
     #[test]

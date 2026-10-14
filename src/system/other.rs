@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 
 pub const DEFAULT_DEVICE_LABEL: &str = "System default";
+// shortcut: no loopback inputs off Windows; cpal supports it on macOS 14.6+, enable once tested there.
+pub const LOOPBACK: bool = false;
 pub const AUTOSTART_LABEL: Option<&str> = None;
 
 pub struct ShowRequests;

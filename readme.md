@@ -49,6 +49,7 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 - **One copy at a time.** Starting NymPlayer again brings the running copy to the front.
 - **Automatic device switching**, also while minimized. If the chosen device is unplugged, playback moves to the Windows default and switches back when the device returns. "Windows default" follows changes to the system default.
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
+- **Play what the PC plays** (loopback). The Input list also offers each output device as *"What plays on …"*: everything the PC plays through it, such as music, videos or games. Combined with casting, it sends the PC's sound to your Google speakers. Looping a device back into itself would echo endlessly, so NymPlayer refuses that combination: choose another output or cast.
 - **Cast to Google speakers** (experimental). Click the cast icon at the top right to find Google Home, Nest and Chromecast speakers and speaker groups on your network, and pick one to play there instead of on this PC. See [Casting](#casting-experimental).
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.
 

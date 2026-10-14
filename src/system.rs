@@ -3,6 +3,7 @@
 //! - `single_instance() -> Option<ShowRequests>`, `ShowRequests::watch`
 //! - `autostart()`, `set_autostart(on)`, `AUTOSTART_LABEL` (`None` hides the option)
 //! - `tray_icon()`, `config_dir()`, `DEFAULT_DEVICE_LABEL`
+//! - `LOOPBACK`: whether output devices can be used as inputs (recording what plays)
 
 #[cfg(windows)]
 mod windows;

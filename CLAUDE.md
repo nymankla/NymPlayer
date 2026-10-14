@@ -55,6 +55,12 @@ Device handling, in `App::sync()`:
 - It restarts the streams when that decision changes or when `failed` is set. This is how unplugging, re-plugging and default-device changes are handled.
 - Dropping `Running` stops the streams.
 
+Loopback inputs (`system::LOOPBACK`, Windows only for now):
+- `refresh_devices` also lists every output device as an input with ID `LOOPBACK` + its device ID ("What plays on …"). `sync()` resolves these among the *output* devices, with no fallback to a microphone.
+- cpal turns an input stream on a WASAPI output device into loopback recording by itself. `start()` falls back to the device's output format, because it has no input format.
+- **Feedback guard:** `loops_back()` refuses loopback into the same output device (also when the output is "Windows default" and resolves to it), since that echoes endlessly. Casting is fine.
+- Windows sends no loopback audio while nothing plays, so the cast stream fills gaps over `cast::GAP` with silence, or the speaker would run dry and stop.
+
 Device identity:
 - Devices are identified by **cpal's `DeviceId`**, kept as a string (`dev_id()`, e.g. `wasapi:{0.0.0.00000000}.{guid}`). Settings store the ID; an empty string means "Windows default".
 - The dropdowns show `Entry::label`, the device name with duplicates numbered "(2)", "(3)".
