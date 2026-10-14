@@ -4,6 +4,9 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+- Cast to Google speakers (experimental): a cast icon finds Google Home, Nest and Chromecast speakers and groups on the network (mDNS) and streams the input to the chosen one. The speaker must be allowed to connect to the PC through the firewall.
+
 ## [0.1.2] - 2026-10-14
 
 ### Changed

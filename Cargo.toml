@@ -8,7 +8,9 @@ license = "MIT"
 cpal = "0.18.2"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 ringbuf = "0.5.3"
+oxicast = "0.0.3"
 rubato = "5.0.1"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 tray-icon = "0.26.1"
 
 [target.'cfg(windows)'.dependencies]

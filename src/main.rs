@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+mod cast;
 mod system;
 
 /// Empty selection means "follow the system default device".
@@ -174,7 +175,9 @@ struct Shared {
 
 struct Running {
     _input: cpal::Stream,
-    _output: cpal::Stream,
+    /// A local output device, or else a cast session.
+    _output: Option<cpal::Stream>,
+    cast: Option<cast::Session>,
     in_id: String,
     out_id: String,
     in_name: String,
@@ -200,6 +203,10 @@ struct App {
     hidden: bool,
     /// Registered to start with Windows (the registry is the source of truth).
     autostart: bool,
+    /// Casting to this speaker instead of the local output.
+    // shortcut: the cast target isn't saved in settings; save it if people want casting to resume at start.
+    cast: Option<cast::Device>,
+    discovery: Arc<cast::Discovery>,
 }
 
 impl App {
@@ -223,6 +230,8 @@ impl App {
             tray,
             hidden: false,
             autostart,
+            cast: None,
+            discovery: Arc::default(),
         };
         app.update_gain();
         app.show_tray_icon(autostart);
@@ -287,6 +296,43 @@ impl App {
         }
     }
 
+    /// The cast icon and its menu of speakers. Returns `Some(target)` when the user picks
+    /// a speaker, or `Some(None)` for "Stop casting".
+    fn cast_menu(&self, ui: &mut egui::Ui) -> Option<Option<cast::Device>> {
+        let icon = cast_icon(ui, self.cast.is_some()).on_hover_text("Cast to a Google speaker (experimental)");
+        if icon.clicked() {
+            let ctx = ui.ctx().clone();
+            self.discovery.search(move || ctx.request_repaint());
+        }
+        let mut pick = None;
+        egui::Popup::menu(&icon).show(|ui| {
+            ui.set_min_width(220.0);
+            ui.label(egui::RichText::new("Cast to").strong());
+            let devices = self.discovery.devices.lock().unwrap();
+            for d in devices.iter() {
+                let on = self.cast.as_ref().is_some_and(|c| c.name == d.name);
+                if ui.selectable_label(on, &d.name).clicked() && !on {
+                    pick = Some(Some(d.clone()));
+                }
+            }
+            if self.discovery.searching.load(Ordering::Relaxed) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Searching…");
+                });
+            } else if devices.is_empty() {
+                ui.label("No speakers found");
+            }
+            if self.cast.is_some() {
+                ui.separator();
+                if ui.button("Stop casting").clicked() {
+                    pick = Some(None);
+                }
+            }
+        });
+        pick
+    }
+
     fn refresh_devices(&mut self) {
         self.inputs = self.host.input_devices().map(entries).unwrap_or_default();
         self.outputs = self.host.output_devices().map(entries).unwrap_or_default();
@@ -299,6 +345,14 @@ impl App {
     fn sync(&mut self) {
         self.last_sync = Instant::now();
         self.refresh_devices();
+        // The speaker stopped the cast (or it failed): stop rather than suddenly play locally.
+        if let Some(why) = self.running.as_ref().and_then(|r| r.cast.as_ref()?.ended()) {
+            self.cast = None;
+            self.running = None; // before set_playing, whose sync() would see the ended cast again
+            self.set_playing(false);
+            self.status = why;
+            return;
+        }
         if !self.settings.playing {
             self.running = None;
             return;
@@ -306,7 +360,11 @@ impl App {
         let s = &self.settings;
         let inp = pick(self.host.input_devices().ok(), self.host.default_input_device(), &s.input);
         let out = pick(self.host.output_devices().ok(), self.host.default_output_device(), &s.output);
-        let want = (inp.as_ref().and_then(dev_id), out.as_ref().and_then(dev_id));
+        let out_id = match &self.cast {
+            Some(c) => Some(c.id()),
+            None => out.as_ref().and_then(dev_id),
+        };
+        let want = (inp.as_ref().and_then(dev_id), out_id);
         let stale = match &self.running {
             Some(r) => {
                 r.shared.failed.load(Ordering::Relaxed)
@@ -318,8 +376,13 @@ impl App {
             return;
         }
         self.running = None; // release the old devices first
+        let out = match (&self.cast, &out) {
+            (Some(c), _) => Some(Output::Cast(c)),
+            (None, Some(o)) => Some(Output::Device(o)),
+            (None, None) => None,
+        };
         match (inp, out) {
-            (Some(i), Some(o)) => match start(&i, &o, self.gain.clone()) {
+            (Some(i), Some(o)) => match start(&i, o, self.gain.clone()) {
                 Ok(r) => {
                     self.status = format!("Playing: {} to {}", r.in_name, r.out_name);
                     self.running = Some(r);
@@ -379,6 +442,7 @@ impl eframe::App for App {
         let mut changed = false;
         let mut volume_done = false;
         let mut toggle = false;
+        let mut cast_change = None;
         let live = self.running.is_some();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0))
@@ -388,6 +452,9 @@ impl eframe::App for App {
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new("NymPlayer").size(24.0).strong().color(egui::Color32::WHITE));
                         ui.label(egui::RichText::new("USB input to any output").color(WOOD));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        cast_change = self.cast_menu(ui);
                     });
                 });
                 ui.add_space(4.0);
@@ -399,7 +466,12 @@ impl eframe::App for App {
                         level_meter(ui, meter(self.in_level));
                         ui.end_row();
                         ui.label("Output");
-                        changed |= device_combo(ui, "out", &mut s.output, &self.outputs);
+                        match &self.cast {
+                            Some(c) => {
+                                ui.label(egui::RichText::new(format!("Casting to {}", c.name)).color(ACCENT));
+                            }
+                            None => changed |= device_combo(ui, "out", &mut s.output, &self.outputs),
+                        }
                         level_meter(ui, meter(self.out_level));
                         ui.end_row();
                         ui.label("Volume");
@@ -460,6 +532,14 @@ impl eframe::App for App {
         if toggle {
             self.set_playing(!self.settings.playing);
         }
+        if let Some(target) = cast_change {
+            self.cast = target;
+            if self.cast.is_some() && !self.settings.playing {
+                self.set_playing(true);
+            } else {
+                self.sync();
+            }
+        }
 
         if changed || volume_done {
             self.settings.save();
@@ -484,6 +564,41 @@ fn spinning_record(ui: &mut egui::Ui, spinning: bool) {
     let angle = if spinning { ui.input(|i| i.time) as f32 * 2.5 } else { 0.0 };
     p.circle_filled(c + 15.0 * egui::vec2(angle.cos(), angle.sin()), 2.0, egui::Color32::from_gray(150));
     p.circle_filled(c, 1.5, egui::Color32::LIGHT_GRAY);
+}
+
+/// The usual cast symbol (a screen with waves in its corner), painted since the font
+/// has no glyph for it. Accent-coloured while casting.
+fn cast_icon(ui: &mut egui::Ui, active: bool) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::click());
+    let color = if active {
+        ACCENT
+    } else if r.hovered() {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::GRAY
+    };
+    let stroke = egui::Stroke::new(2.0, color);
+    let p = ui.painter();
+    let screen = rect.shrink2(egui::vec2(3.0, 5.0));
+    let (min, max) = (screen.min, screen.max);
+    // Screen outline, open at the bottom left where the waves are.
+    p.line(
+        vec![egui::pos2(min.x, min.y + 5.0), min, egui::pos2(max.x, min.y), max, egui::pos2(min.x + 9.0, max.y)],
+        stroke,
+    );
+    let corner = egui::pos2(min.x, max.y);
+    p.circle_filled(corner + egui::vec2(1.0, -1.0), 2.0, color);
+    for radius in [5.5, 9.5] {
+        let arc = (0..=8)
+            .map(|i| {
+                // Quarter circle from straight up to straight right of the corner.
+                let a = std::f32::consts::FRAC_PI_2 * i as f32 / 8.0;
+                corner + radius * egui::vec2(a.sin(), -a.cos())
+            })
+            .collect();
+        p.line(arc, stroke);
+    }
+    r
 }
 
 /// Segmented LED-style meter, green to amber to red, for a 0..1 level.
@@ -581,19 +696,25 @@ fn pick(
     devs.and_then(|mut d| d.find(|d| dev_id(d).as_deref() == Some(sel))).or(default)
 }
 
-fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result<Running, String> {
+/// Where the audio goes.
+enum Output<'a> {
+    Device(&'a cpal::Device),
+    Cast(&'a cast::Device),
+}
+
+fn start(inp: &cpal::Device, out: Output, gain: Arc<AtomicU32>) -> Result<Running, String> {
     let e = |e: cpal::Error| e.to_string();
     let icfg = inp.default_input_config().map_err(e)?;
     let ich = icfg.channels() as usize;
     let in_rate = icfg.sample_rate();
-    let ocfg = out.default_output_config().map_err(e)?;
-    let och = ocfg.channels() as usize;
-    let target = in_rate as usize * TARGET_MS / 1000;
-    let mut converter = Converter::new(ich, ocfg.sample_rate() as f64 / in_rate as f64, target)?;
-
+    let frames = match out {
+        // Headroom only: the converter holds the fill near its target, so this rarely fills up.
+        Output::Device(_) => in_rate as usize * TARGET_MS / 1000 * 5,
+        // The network side reads in bursts; 2 s rides out a slow Wi-Fi moment.
+        Output::Cast(_) => in_rate as usize * 2,
+    };
     let shared = Arc::new(Shared::default());
-    // Headroom only: the converter holds the fill near `target`, so this rarely fills up.
-    let (prod, mut cons) = HeapRb::<f32>::new(target * 5 * ich).split();
+    let (prod, cons) = HeapRb::<f32>::new(frames * ich).split();
 
     use cpal::SampleFormat as F;
     let (cfg, s) = (icfg.config(), shared.clone());
@@ -606,9 +727,49 @@ fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result
     }
     .map_err(e)?;
 
+    let (output, cast, out_id, out_name) = match out {
+        Output::Device(o) => {
+            let stream = build_output(o, ich, in_rate, cons, gain, shared.clone())?;
+            (Some(stream), None, dev_id(o).unwrap_or_default(), name(o).unwrap_or_default())
+        }
+        Output::Cast(d) => {
+            let session = cast::Session::start(d, in_rate, ich, cons, gain, shared.clone())?;
+            (None, Some(session), d.id(), format!("{} (Cast)", d.name))
+        }
+    };
+    input.play().map_err(e)?;
+    if let Some(o) = &output {
+        o.play().map_err(e)?;
+    }
+    Ok(Running {
+        _input: input,
+        _output: output,
+        cast,
+        in_id: dev_id(inp).unwrap_or_default(),
+        out_id,
+        in_name: name(inp).unwrap_or_default(),
+        out_name,
+        in_rate,
+        shared,
+    })
+}
+
+/// Local output stream: resamples the input to the device's rate and applies the gain.
+fn build_output(
+    out: &cpal::Device,
+    ich: usize,
+    in_rate: u32,
+    mut cons: ringbuf::HeapCons<f32>,
+    gain: Arc<AtomicU32>,
+    shared: Arc<Shared>,
+) -> Result<cpal::Stream, String> {
+    let e = |e: cpal::Error| e.to_string();
+    let ocfg = out.default_output_config().map_err(e)?;
+    let och = ocfg.channels() as usize;
+    let target = in_rate as usize * TARGET_MS / 1000;
+    let mut converter = Converter::new(ich, ocfg.sample_rate() as f64 / in_rate as f64, target)?;
     let s = shared.clone();
-    let output = out
-        .build_output_stream(
+    out.build_output_stream(
             ocfg.config(),
             move |data: &mut [f32], _: &_| {
                 let primed = converter.primed;
@@ -621,23 +782,10 @@ fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result
                 data.iter_mut().for_each(|x| *x *= g);
                 s.out_peak.fetch_max(peak(data).to_bits(), Ordering::Relaxed);
             },
-            fail(shared.clone()),
+            fail(shared),
             None,
         )
-        .map_err(e)?;
-
-    input.play().map_err(e)?;
-    output.play().map_err(e)?;
-    Ok(Running {
-        _input: input,
-        _output: output,
-        in_id: dev_id(inp).unwrap_or_default(),
-        out_id: dev_id(out).unwrap_or_default(),
-        in_name: name(inp).unwrap_or_default(),
-        out_name: name(out).unwrap_or_default(),
-        in_rate,
-        shared,
-    })
+        .map_err(e)
 }
 
 /// Error callback: marks the streams for a restart, except for errors cpal reports while

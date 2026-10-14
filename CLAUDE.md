@@ -39,6 +39,13 @@ Audio path, in `start()`:
 - `Shared` (atomics only) carries peak levels (f32 bits with `fetch_max`) and a `failed` flag set by the cpal error callbacks (`fail()`). Non-fatal errors (`Xrun`, `DeviceChanged`, `RealtimeDenied`) don't set it: the stream keeps running, and a restart is more audible than the glitch.
 - Diagnostics: run with `NYMPLAYER_TRACE=<file>` and `App::trace` appends one line per second (unix time, buffer fill in ms, underruns, dropped input frames, xruns, failed, status), from counters in `Shared`. Counters reset when the streams restart.
 
+Casting (`src/cast.rs`, experimental), an alternative to the local output device (`enum Output` in `start()`):
+- **Discovery:** `cast::Discovery::search` runs `oxicast`'s mDNS browse (`_googlecast._tcp`) on a background thread when the cast icon is clicked, filling a shared list.
+- **Session:** `cast::Session::start` serves the live input as endless 16-bit stereo WAV over a small `std` HTTP server (bound to the local address that routes to the speaker), then a control thread uses `oxicast` to launch the Default Media Receiver and load that URL as a live stream. The ring buffer holds 2 s for casting. A new HTTP request takes over and clears stale audio.
+- **Threads:** `oxicast` is async; each discovery and each session runs a current-thread tokio runtime on its own thread. The GUI and audio code stay synchronous.
+- **Ending:** dropping `Session` stops the stream and the speaker app. If the speaker ends the session, or never fetches the stream within 10 s (usually the firewall), `Session::ended` returns a reason; `sync()` then stops playback rather than switching to the local output.
+- The speaker must open an incoming connection to this PC, so a firewall that blocks inbound traffic (e.g. company policy) makes casting impossible. The streaming itself is covered by the loopback test `serves_live_wav_over_http`.
+
 Device handling, in `App::sync()`:
 - `sync()` runs every second from `App::logic()`, which (unlike `ui()`) still runs while the window is minimized. It also runs on any device or Play/Stop change.
 - It re-enumerates devices and decides which devices to use: the saved selection if it's present, otherwise the Windows default. An empty selection string means "follow the Windows default".
