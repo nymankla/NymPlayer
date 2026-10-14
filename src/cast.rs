@@ -192,9 +192,11 @@ fn serve(
     let mut bytes = Vec::with_capacity(4096 * 4);
     while !stop.load(Ordering::Relaxed) {
         if let Ok((c, _)) = listener.accept() {
-            fetched.store(true, Ordering::Relaxed); // before responding, so a fast client sees it
-            conn = respond(c, rate).ok();
+            // Both before responding: once the client has the headers, it may already be
+            // waiting for audio pushed after them.
+            fetched.store(true, Ordering::Relaxed);
             cons.clear(); // start from live audio, not what piled up while waiting
+            conn = respond(c, rate).ok();
         }
         let n = cons.pop_slice(&mut samples);
         let Some(c) = conn.as_mut().filter(|_| n > 0) else {
@@ -284,6 +286,7 @@ mod tests {
         let server = std::thread::spawn(move || serve(listener, 44100, 1, cons, gain, Arc::default(), s, f));
 
         let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); // fail rather than hang
         c.write_all(b"GET /nymplayer.wav HTTP/1.1\r\n\r\n").unwrap();
         let mut head = vec![0u8; 4096];
         let mut got = 0;
