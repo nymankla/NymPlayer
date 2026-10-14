@@ -29,14 +29,15 @@ Audio path, in `start()`:
 - **cpal (WASAPI)**: an input stream and an output stream, each with its own callback thread.
 - **Input callback** (`build_input::<T>`, generic over f32/i16/i32/u16) converts to f32 and pushes into a `ringbuf` lock-free SPSC buffer (capacity 5× target). It pushes **whole frames only**, so channels never get shifted. When the buffer is full, the newest audio is dropped (a safety net only).
 - **Output callback** runs `Converter::fill`:
-  - It waits until `TARGET_MS` (20 ms) is buffered, and waits again after each underrun.
+  - It waits until `TARGET_MS` (40 ms) is buffered, and waits again after each underrun. When it (re)starts, it discards any backlog beyond the target, since the drift correction would only drain it slowly.
   - It resamples with rubato's `Async` sinc resampler (fixed output chunks of `CHUNK` frames, ratio = out_rate / in_rate). Resampled frames sit in `pending[pos..]` until they're played.
   - **Drift correction:** each callback nudges the ratio (±0.5% max, via `set_resample_ratio_relative`) in proportion to how far the smoothed buffer fill is from the target. This keeps the latency steady when the two device clocks differ, instead of dropping audio or underrunning.
   - It maps channels: extra output channels repeat the last input channel, so mono feeds both ears.
   - Output buffers arrive pre-filled with silence from cpal.
 - After the converter, the output callback multiplies by the gain (`App::gain`, f32 bits in an `AtomicU32`; 0 when muted).
 - The audio callbacks must not allocate: the scratch buffers are sized up front.
-- `Shared` (atomics only) carries peak levels (f32 bits with `fetch_max`) and a `failed` flag set by the cpal error callbacks.
+- `Shared` (atomics only) carries peak levels (f32 bits with `fetch_max`) and a `failed` flag set by the cpal error callbacks (`fail()`). Non-fatal errors (`Xrun`, `DeviceChanged`, `RealtimeDenied`) don't set it: the stream keeps running, and a restart is more audible than the glitch.
+- Diagnostics: run with `NYMPLAYER_TRACE=<file>` and `App::trace` appends one line per second (unix time, buffer fill in ms, underruns, dropped input frames, xruns, failed, status), from counters in `Shared`. Counters reset when the streams restart.
 
 Device handling, in `App::sync()`:
 - `sync()` runs every second from `App::logic()`, which (unlike `ui()`) still runs while the window is minimized. It also runs on any device or Play/Stop change.

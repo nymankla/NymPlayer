@@ -4,8 +4,17 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-14
+
 ### Added
 - Install, update and uninstall instructions in the readme, with CI, release and license badges and a download link.
+- Screenshot in the readme.
+- `NYMPLAYER_TRACE=<file>` writes a once-per-second diagnostic log (buffer fill, underruns, dropped input, xruns).
+
+### Fixed
+- Up to 70 ms of extra delay for the first ~40 seconds after playback started, when the output (typically Bluetooth) started late.
+- Clicks roughly every 30 seconds with Bluetooth output: the buffer target is raised from 20 to 40 ms.
+- Repeated dropouts after about 5 minutes of playback: a brief input glitch (xrun) restarted both streams. Glitches the stream recovers from on its own no longer cause a restart.
 
 ## [0.1.0] - 2026-10-13
 
@@ -24,5 +33,6 @@ First release.
 - Only one copy runs at a time; starting it again brings the running copy to the front.
 - Record-player icon.
 
-[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/nymankla/NymPlayer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nymankla/NymPlayer/releases/tag/v0.1.0

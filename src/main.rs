@@ -165,6 +165,12 @@ struct Shared {
     in_peak: AtomicU32,
     out_peak: AtomicU32,
     failed: AtomicBool,
+    /// Diagnostics for `NYMPLAYER_TRACE`: underruns, input frames dropped because the
+    /// buffer was full, xruns reported by cpal, and the smoothed buffer fill in input frames (f32 bits).
+    underruns: AtomicU32,
+    dropped: AtomicU32,
+    xruns: AtomicU32,
+    fill: AtomicU32,
 }
 
 struct Running {
@@ -174,6 +180,7 @@ struct Running {
     out_id: String,
     in_name: String,
     out_name: String,
+    in_rate: u32,
     shared: Arc<Shared>,
 }
 
@@ -252,6 +259,27 @@ impl App {
 
     /// Refreshes device lists and (re)starts the streams when the device to use has
     /// changed: unplugged, plugged back in, or a new Windows default.
+    /// With `NYMPLAYER_TRACE=<file>` set, appends one line per second:
+    /// unix time, buffer fill (ms), underruns, dropped input frames, xruns, failed, status.
+    fn trace(&self) {
+        let Some(path) = std::env::var_os("NYMPLAYER_TRACE") else { return };
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let line = match &self.running {
+            Some(r) => {
+                let s = &r.shared;
+                let fill = f32::from_bits(s.fill.load(Ordering::Relaxed)) * 1000.0 / r.in_rate as f32;
+                let (u, d) = (s.underruns.load(Ordering::Relaxed), s.dropped.load(Ordering::Relaxed));
+                let x = s.xruns.load(Ordering::Relaxed);
+                format!("{} {fill:.2} {u} {d} {x} {} {}", t.as_secs(), s.failed.load(Ordering::Relaxed) as u8, self.status)
+            }
+            None => format!("{} - - - - - {}", t.as_secs(), self.status),
+        };
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
     fn sync(&mut self) {
         self.last_sync = Instant::now();
         self.inputs = self.host.input_devices().map(entries).unwrap_or_default();
@@ -319,6 +347,7 @@ impl eframe::App for App {
         }
 
         if self.last_sync.elapsed() > Duration::from_secs(1) {
+            self.trace();
             self.sync();
         }
         let wait = if self.running.is_some() && !self.hidden { 33 } else { 1000 };
@@ -567,7 +596,12 @@ fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result
         .build_output_stream(
             ocfg.config(),
             move |data: &mut [f32], _: &_| {
+                let primed = converter.primed;
                 converter.fill(data, och, &mut cons);
+                if primed && !converter.primed {
+                    s.underruns.fetch_add(1, Ordering::Relaxed);
+                }
+                s.fill.store((converter.fill as f32).to_bits(), Ordering::Relaxed);
                 let g = f32::from_bits(gain.load(Ordering::Relaxed));
                 data.iter_mut().for_each(|x| *x *= g);
                 s.out_peak.fetch_max(peak(data).to_bits(), Ordering::Relaxed);
@@ -586,12 +620,21 @@ fn start(inp: &cpal::Device, out: &cpal::Device, gain: Arc<AtomicU32>) -> Result
         out_id: dev_id(out).unwrap_or_default(),
         in_name: name(inp).unwrap_or_default(),
         out_name: name(out).unwrap_or_default(),
+        in_rate,
         shared,
     })
 }
 
+/// Error callback: marks the streams for a restart, except for errors cpal reports while
+/// the stream keeps running. A USB input reported an xrun every few seconds after ~5 min,
+/// and restarting for each one was far more audible than the glitch itself.
 fn fail(shared: Arc<Shared>) -> impl FnMut(cpal::Error) + Send + 'static {
-    move |_| shared.failed.store(true, Ordering::Relaxed)
+    use cpal::ErrorKind as K;
+    move |e| match e.kind() {
+        K::Xrun => _ = shared.xruns.fetch_add(1, Ordering::Relaxed),
+        K::DeviceChanged | K::RealtimeDenied => {}
+        _ => shared.failed.store(true, Ordering::Relaxed),
+    }
 }
 
 /// Input stream for any sample type cpal can convert to f32 (devices that don't capture
@@ -619,6 +662,7 @@ where
             // audio is dropped.
             let n = scratch.len().min(prod.vacant_len() / ich * ich);
             prod.push_slice(&scratch[..n]);
+            shared.dropped.fetch_add(((scratch.len() - n) / ich) as u32, Ordering::Relaxed);
         },
         fail,
         None,
@@ -626,7 +670,8 @@ where
 }
 
 /// Buffered input the converter aims to keep: enough to ride out callback jitter.
-const TARGET_MS: usize = 20;
+/// Bluetooth outputs pull in uneven bursts; 20 ms underran about every 30 s.
+const TARGET_MS: usize = 40;
 /// Output frames per resampler chunk. Small, as it adds to latency.
 const CHUNK: usize = 64;
 
@@ -669,11 +714,15 @@ impl Converter {
     /// Returns false if `out` was not completely filled.
     fn fill(&mut self, out: &mut [f32], och: usize, cons: &mut impl Consumer<Item = f32>) -> bool {
         let ich = self.ich;
-        let avail = (cons.occupied_len() / ich) as f64;
+        let mut avail = (cons.occupied_len() / ich) as f64;
         if !self.primed {
             if avail < self.target {
                 return false;
             }
+            // Start at the target: a backlog (e.g. from an output that starts late) would
+            // otherwise only drain slowly through the gentle drift correction.
+            cons.skip((avail - self.target) as usize * ich);
+            avail = self.target;
             self.primed = true;
             self.fill = avail;
         }
@@ -776,10 +825,11 @@ mod tests {
         c
     }
 
-    /// Runs input through a fresh converter and returns `frames` output frames.
+    /// Runs input through a fresh converter and returns `frames` output frames. The
+    /// target is the whole input, so priming doesn't trim any of it.
     fn convert(input: &[f32], ich: usize, ratio: f64, och: usize, frames: usize) -> Vec<f32> {
         let mut out = vec![0.0; frames * och];
-        Converter::new(ich, ratio, 32).unwrap().fill(&mut out, och, &mut buffer(input));
+        Converter::new(ich, ratio, input.len() / ich).unwrap().fill(&mut out, och, &mut buffer(input));
         out
     }
 
@@ -800,13 +850,13 @@ mod tests {
     #[test]
     fn resamples_48k_to_44k1() {
         let mut cons = buffer(&[0.5; 4800]);
-        let mut c = Converter::new(1, 44100.0 / 48000.0, 32).unwrap();
+        let mut c = Converter::new(1, 44100.0 / 48000.0, 4800).unwrap();
         let mut out = [0.0; 100];
         let mut produced = 0;
         while c.fill(&mut out, 1, &mut cons) {
             produced += out.len();
         }
-        // ~4410, minus what the last partial block, the target fill and the filter hold back.
+        // ~4410, minus what the last partial block and the filter hold back.
         assert!((4200..=4410).contains(&produced), "{produced}");
     }
 
@@ -815,12 +865,22 @@ mod tests {
         let consumed = |target| {
             let mut cons = buffer(&[0.5; 20000]);
             let mut out = vec![0.0; 10000];
-            Converter::new(1, 1.0, target).unwrap().fill(&mut out, 1, &mut cons);
+            // Already running with this fill (priming would trim it to the target).
+            let mut c = Converter::new(1, 1.0, target).unwrap();
+            (c.primed, c.fill) = (true, 20000.0);
+            c.fill(&mut out, 1, &mut cons);
             20000 - cons.occupied_len()
         };
         // Far above target the ratio is clamped 0.5% low: ~50 extra frames per 10000.
         let (overfull, on_target) = (consumed(32), consumed(20000));
         assert!(overfull > on_target + 30, "{overfull} vs {on_target}");
+    }
+
+    #[test]
+    fn starts_at_target_after_backlog() {
+        let mut cons = buffer(&[0.5; 20000]);
+        Converter::new(1, 1.0, 32).unwrap().fill(&mut [0.0; 1], 1, &mut cons);
+        assert!(cons.occupied_len() <= 32, "{}", cons.occupied_len());
     }
 
     #[test]
