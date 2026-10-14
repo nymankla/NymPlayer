@@ -192,8 +192,8 @@ fn serve(
     let mut bytes = Vec::with_capacity(4096 * 4);
     while !stop.load(Ordering::Relaxed) {
         if let Ok((c, _)) = listener.accept() {
+            fetched.store(true, Ordering::Relaxed); // before responding, so a fast client sees it
             conn = respond(c, rate).ok();
-            fetched.store(true, Ordering::Relaxed);
             cons.clear(); // start from live audio, not what piled up while waiting
         }
         let n = cons.pop_slice(&mut samples);

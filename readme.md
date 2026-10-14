@@ -8,7 +8,7 @@ A small Windows app that plays live audio from an input device, such as a USB au
 
 **[⬇ Download the latest version](https://github.com/nymankla/NymPlayer/releases/latest)**: a single `.exe`, no installer.
 
-<img src="assets/screenshot.png" alt="NymPlayer window: input and output dropdowns with level meters, volume slider, Stop button and the Start with Windows option" width="440">
+<img src="assets/screenshot.png" alt="NymPlayer window: cast icon, input and output dropdowns with level meters, volume slider, Stop button and the Start with Windows option" width="440">
 
 ## Install
 
