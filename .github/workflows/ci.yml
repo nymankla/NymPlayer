@@ -1,10 +1,8 @@
 name: CI
 
-# Only on version tags (alongside the release workflow), or started by hand from the
-# Actions tab; plain pushes and pull requests don't build.
+# Started by hand from the Actions tab (e.g. before tagging); plain pushes and pull requests
+# don't build. Releases build and test on all three systems themselves (release.yml).
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 env:

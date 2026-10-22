@@ -17,13 +17,13 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 mod cast;
+mod record;
 mod system;
 
 /// Empty selection means "follow the system default device".
 const SYSTEM_DEFAULT: &str = "";
-/// Input selection prefix for an output device's loopback (what the PC plays through it),
-/// followed by that output device's ID.
-const LOOPBACK: &str = "loopback:";
+/// Input selection for `system::PcSound`: everything the PC plays except NymPlayer.
+const PC_SOUND_ID: &str = "pcsound";
 
 fn main() -> eframe::Result {
     let Some(show_requests) = system::single_instance() else {
@@ -175,10 +175,12 @@ struct Shared {
 }
 
 struct Running {
-    _input: cpal::Stream,
-    /// A local output device, or else a cast session.
+    /// A cpal input stream or a `system::PcSound` capture, only kept alive.
+    _input: Box<dyn std::any::Any>,
+    /// A local output device, or else a cast session or a recording.
     _output: Option<cpal::Stream>,
     cast: Option<cast::Session>,
+    recording: Option<record::Recording>,
     in_id: String,
     out_id: String,
     in_name: String,
@@ -191,6 +193,9 @@ struct App {
     host: cpal::Host,
     inputs: Vec<Entry>,
     outputs: Vec<Entry>,
+    /// The devices behind `inputs`/`outputs`, from the same enumeration, for `pick`.
+    in_devs: Vec<cpal::Device>,
+    out_devs: Vec<cpal::Device>,
     settings: Settings,
     /// Output gain as f32 bits, read by the output callback; 0 when muted.
     gain: Arc<AtomicU32>,
@@ -208,6 +213,10 @@ struct App {
     // shortcut: the cast target isn't saved in settings; save it if people want casting to resume at start.
     cast: Option<cast::Device>,
     discovery: Arc<cast::Discovery>,
+    /// Recording to this file instead of any output (local or cast).
+    recording: Option<record::Target>,
+    /// The save dialog's answer while it's open: a path, or `None` if cancelled.
+    save_dialog: Option<mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 impl App {
@@ -220,6 +229,8 @@ impl App {
             host: cpal::default_host(),
             inputs: vec![],
             outputs: vec![],
+            in_devs: vec![],
+            out_devs: vec![],
             settings: Settings::load(),
             gain: Arc::default(),
             running: None,
@@ -233,6 +244,8 @@ impl App {
             autostart,
             cast: None,
             discovery: Arc::default(),
+            recording: None,
+            save_dialog: None,
         };
         app.update_gain();
         app.show_tray_icon(autostart);
@@ -302,6 +315,49 @@ impl App {
         }
     }
 
+    /// Opens the save dialog for a recording; its answer arrives in `logic` via
+    /// `save_dialog`. It runs on its own thread: on Windows, cpal has set this thread's COM
+    /// to multithreaded mode, which the file dialog can't use (it would silently fail).
+    fn open_save_dialog(&mut self, ctx: &egui::Context) {
+        use record::Format;
+        let last = Format::from_ext(&self.settings.record_format).unwrap_or(Format::Wav);
+        let name = format!("NymPlayer {}.{}", system::local_timestamp(), last.ext());
+        let mut dialog = rfd::FileDialog::new().set_title("Record to file").set_file_name(name);
+        // The last used format first, so it's the dialog's default file type.
+        for f in std::iter::once(last).chain(Format::ALL.into_iter().filter(|&f| f != last)) {
+            dialog = dialog.add_filter(f.label(), &[f.ext()]);
+        }
+        if !self.settings.record_dir.is_empty() {
+            dialog = dialog.set_directory(&self.settings.record_dir);
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(dialog.save_file());
+            ctx.request_repaint();
+        });
+        self.save_dialog = Some(rx);
+    }
+
+    /// Starts recording to the file chosen in the save dialog, and remembers its folder and
+    /// format for next time.
+    fn start_recording(&mut self, mut path: std::path::PathBuf) {
+        use record::Format;
+        let last = Format::from_ext(&self.settings.record_format).unwrap_or(Format::Wav);
+        // A name without a known extension gets the last used format's.
+        let format = Format::of(&path).unwrap_or_else(|| {
+            let mut p = path.clone().into_os_string();
+            p.push(format!(".{}", last.ext()));
+            path = p.into();
+            last
+        });
+        self.settings.record_dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        self.settings.record_format = format.ext().into();
+        self.settings.save();
+        self.recording = Some(record::Target { path, format });
+        self.sync();
+    }
+
     /// The cast icon and its menu of speakers. Returns `Some(target)` when the user picks
     /// a speaker, or `Some(None)` for "Stop casting".
     fn cast_menu(&self, ui: &mut egui::Ui) -> Option<Option<cast::Device>> {
@@ -353,15 +409,13 @@ impl App {
     }
 
     fn refresh_devices(&mut self) {
-        self.inputs = self.host.input_devices().map(entries).unwrap_or_default();
-        self.outputs = self.host.output_devices().map(entries).unwrap_or_default();
-        if system::LOOPBACK {
-            self.inputs.extend(self.outputs.iter().map(|e| Entry {
-                id: format!("{LOOPBACK}{}", e.id),
-                name: e.name.clone(),
-                // Meaning first, so it survives when a long name is cut short.
-                label: format!("What plays on {}", e.label),
-            }));
+        // Once per sync: listing devices is the costly part (a few ms each).
+        self.in_devs = self.host.input_devices().map(Iterator::collect).unwrap_or_default();
+        self.out_devs = self.host.output_devices().map(Iterator::collect).unwrap_or_default();
+        self.inputs = entries(self.in_devs.iter().cloned());
+        self.outputs = entries(self.out_devs.iter().cloned());
+        if let Some(label) = system::PC_SOUND {
+            self.inputs.push(Entry { id: PC_SOUND_ID.into(), name: label.into(), label: label.into() });
         }
         let s = &mut self.settings;
         if migrate(&mut s.input, &self.inputs) | migrate(&mut s.output, &self.outputs) {
@@ -380,29 +434,30 @@ impl App {
             self.status = why;
             return;
         }
-        if !self.settings.playing {
+        // A write error (e.g. a full disk) stopped the recording; the file is already finished.
+        if let Some(why) = self.running.as_ref().and_then(|r| r.recording.as_ref()?.ended()) {
+            self.recording = None;
+            self.running = None;
+            self.status = why;
+            return;
+        }
+        if !self.settings.playing && self.recording.is_none() {
             self.running = None;
             return;
         }
         let s = &self.settings;
-        let inp = match s.input.strip_prefix(LOOPBACK) {
-            // No fallback: switching to the microphone instead would be a surprise.
-            Some(id) => pick(self.host.output_devices().ok(), None, id),
-            None => pick(self.host.input_devices().ok(), self.host.default_input_device(), &s.input),
+        let inp = if s.input == PC_SOUND_ID && system::PC_SOUND.is_some() {
+            Some(Input::PcSound)
+        } else {
+            pick(&self.in_devs, self.host.default_input_device(), &s.input).map(Input::Device)
         };
-        let out = pick(self.host.output_devices().ok(), self.host.default_output_device(), &s.output);
-        let out_id = match &self.cast {
-            Some(c) => Some(c.id()),
-            None => out.as_ref().and_then(dev_id),
+        let out = pick(&self.out_devs, self.host.default_output_device(), &s.output);
+        let out_id = match (&self.recording, &self.cast) {
+            (Some(t), _) => Some(t.id()),
+            (None, Some(c)) => Some(c.id()),
+            (None, None) => out.as_ref().and_then(dev_id),
         };
-        let want = (inp.as_ref().and_then(dev_id), out_id);
-        if loops_back(&self.settings.input, want.1.as_deref()) {
-            self.running = None;
-            self.status =
-                "Error: can't play what the PC plays back through the same speakers; choose another output or cast"
-                    .into();
-            return;
-        }
+        let want = (inp.as_ref().and_then(Input::id), out_id);
         let stale = match &self.running {
             Some(r) => {
                 r.shared.failed.load(Ordering::Relaxed) || want != (Some(r.in_id.clone()), Some(r.out_id.clone()))
@@ -412,11 +467,19 @@ impl App {
         if !stale {
             return;
         }
+        // Restarting a recording would overwrite its file, so the input changing or failing
+        // mid-recording ends it instead, keeping what was recorded.
+        if let Some(t) = self.recording.take_if(|_| self.running.as_ref().is_some_and(|r| r.recording.is_some())) {
+            self.running = None; // finishes the file
+            self.status = format!("Recording saved to {}; it stopped because the input changed", t.file_name());
+            return;
+        }
         self.running = None; // release the old devices first
-        let out = match (&self.cast, &out) {
-            (Some(c), _) => Some(Output::Cast(c)),
-            (None, Some(o)) => Some(Output::Device(o)),
-            (None, None) => None,
+        let out = match (&self.recording, &self.cast, &out) {
+            (Some(t), _, _) => Some(Output::Record(t)),
+            (None, Some(c), _) => Some(Output::Cast(c)),
+            (None, None, Some(o)) => Some(Output::Device(o)),
+            (None, None, None) => None,
         };
         match (inp, out) {
             (Some(i), Some(o)) => match start(&i, o, self.gain.clone()) {
@@ -436,6 +499,12 @@ impl eframe::App for App {
     // Runs even while the window is minimized (unlike `ui`), so device switching keeps working.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::ViewportCommand as V;
+        if let Some(answer) = self.save_dialog.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.save_dialog = None;
+            if let Some(path) = answer {
+                self.start_recording(path);
+            }
+        }
         while let Some(cmd) = self.tray.as_ref().and_then(|t| t.cmds.try_recv().ok()) {
             match cmd {
                 Cmd::Show => {
@@ -485,6 +554,7 @@ impl eframe::App for App {
         let mut changed = false;
         let mut volume_done = false;
         let mut toggle = false;
+        let mut record_toggle = false;
         let mut cast_change = None;
         let live = self.running.is_some();
         egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0)).show(ui, |ui| {
@@ -538,7 +608,10 @@ impl eframe::App for App {
                 };
                 let text = egui::RichText::new(label).size(18.0).strong().color(egui::Color32::WHITE);
                 let button = egui::Button::new(text).fill(fill).corner_radius(18).min_size(egui::vec2(120.0, 36.0));
-                toggle = ui.add(button).clicked();
+                // Recording replaces playback, so Play/Stop waits until it's done.
+                toggle = ui.add_enabled(self.recording.is_none(), button).clicked();
+                let tip = if self.recording.is_some() { "Stop recording" } else { "Record the input to a file" };
+                record_toggle = record_button(ui, self.recording.is_some()).on_hover_text(tip).clicked();
                 let dot = if live {
                     GREEN
                 } else if self.status.starts_with("Error") {
@@ -550,7 +623,15 @@ impl eframe::App for App {
                 };
                 let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().circle_filled(r.center(), 5.0, dot);
-                ui.add(egui::Label::new(&self.status).truncate());
+                let recording = self.running.as_ref().and_then(|r| r.recording.as_ref().zip(self.recording.as_ref()));
+                let status = match recording {
+                    Some((r, t)) => {
+                        let s = r.started.elapsed().as_secs();
+                        format!("Recording {:02}:{:02} to {}", s / 60, s % 60, t.file_name())
+                    }
+                    None => self.status.clone(),
+                };
+                ui.add(egui::Label::new(status).truncate());
             });
             ui.add_space(12.0);
             let mut on = self.autostart;
@@ -569,6 +650,17 @@ impl eframe::App for App {
 
         if toggle {
             self.set_playing(!self.settings.playing);
+        }
+        if record_toggle {
+            match self.recording.take() {
+                Some(t) => {
+                    self.running = None; // finishes the file before playback (if any) resumes
+                    self.status = format!("Saved {}", t.file_name());
+                    self.sync();
+                }
+                None if self.save_dialog.is_none() => self.open_save_dialog(ui.ctx()),
+                None => {} // the dialog is already open
+            }
         }
         if let Some(target) = cast_change {
             self.cast = target;
@@ -635,6 +727,20 @@ fn cast_icon(ui: &mut egui::Ui, active: bool) -> egui::Response {
             })
             .collect();
         p.line(arc, stroke);
+    }
+    r
+}
+
+/// Round record button: a red dot, or a red square ("stop") while recording.
+fn record_button(ui: &mut egui::Ui, recording: bool) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::click());
+    let p = ui.painter();
+    let bg = if r.hovered() { egui::Color32::from_rgb(85, 85, 96) } else { egui::Color32::from_rgb(70, 70, 80) };
+    p.circle_filled(rect.center(), 18.0, bg);
+    if recording {
+        p.rect_filled(egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0)), 2, ACCENT);
+    } else {
+        p.circle_filled(rect.center(), 8.0, ACCENT);
     }
     r
 }
@@ -729,67 +835,94 @@ fn migrate(sel: &mut String, list: &[Entry]) -> bool {
     }
 }
 
-/// Whether `input` captures the very output it would play to, which would echo endlessly.
-/// `out_id` is the output's device ID (a cast target's never matches).
-fn loops_back(input: &str, out_id: Option<&str>) -> bool {
-    input.strip_prefix(LOOPBACK).is_some_and(|id| out_id == Some(id))
+/// Where the audio comes from.
+enum Input {
+    Device(cpal::Device),
+    /// Everything the PC plays except NymPlayer (`system::PcSound`).
+    PcSound,
+}
+
+impl Input {
+    fn id(&self) -> Option<String> {
+        match self {
+            Input::Device(d) => dev_id(d),
+            Input::PcSound => Some(PC_SOUND_ID.into()),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Input::Device(d) => name(d).unwrap_or_default(),
+            Input::PcSound => system::PC_SOUND.unwrap_or_default().into(),
+        }
+    }
 }
 
 /// The selected device (by ID) if present, otherwise the Windows default.
-fn pick(
-    devs: Option<impl Iterator<Item = cpal::Device>>,
-    default: Option<cpal::Device>,
-    sel: &str,
-) -> Option<cpal::Device> {
+fn pick(devs: &[cpal::Device], default: Option<cpal::Device>, sel: &str) -> Option<cpal::Device> {
     if sel.is_empty() {
         return default;
     }
-    devs.and_then(|mut d| d.find(|d| dev_id(d).as_deref() == Some(sel))).or(default)
+    devs.iter().find(|d| dev_id(d).as_deref() == Some(sel)).cloned().or(default)
 }
 
 /// Where the audio goes.
 enum Output<'a> {
     Device(&'a cpal::Device),
     Cast(&'a cast::Device),
+    /// Into a file only; nothing is played.
+    Record(&'a record::Target),
 }
 
-fn start(inp: &cpal::Device, out: Output, gain: Arc<AtomicU32>) -> Result<Running, String> {
+fn start(inp: &Input, out: Output, gain: Arc<AtomicU32>) -> Result<Running, String> {
     let e = |e: cpal::Error| e.to_string();
-    // An output device here is a loopback input; it only has an output format.
-    let icfg = inp.default_input_config().or_else(|_| inp.default_output_config()).map_err(e)?;
-    let ich = icfg.channels() as usize;
-    let in_rate = icfg.sample_rate();
+    let (ich, in_rate) = match inp {
+        Input::Device(d) => {
+            let c = d.default_input_config().map_err(e)?;
+            (c.channels() as usize, c.sample_rate())
+        }
+        Input::PcSound => (2, system::PC_SOUND_RATE),
+    };
     let frames = match out {
         // Headroom only: the converter holds the fill near its target, so this rarely fills up.
         Output::Device(_) => in_rate as usize * TARGET_MS / 1000 * 5,
         // The network side reads in bursts; 2 s rides out a slow Wi-Fi moment.
         Output::Cast(_) => in_rate as usize * 2,
+        // The writer thread drains it every 20 ms; 2 s covers a slow disk.
+        Output::Record(_) => in_rate as usize * 2,
     };
     let shared = Arc::new(Shared::default());
     let (prod, cons) = HeapRb::<f32>::new(frames * ich).split();
 
-    use cpal::SampleFormat as F;
-    let (cfg, s) = (icfg.config(), shared.clone());
-    let input = match icfg.sample_format() {
-        F::F32 => build_input::<f32>(inp, cfg, prod, s),
-        F::I16 => build_input::<i16>(inp, cfg, prod, s),
-        F::I32 => build_input::<i32>(inp, cfg, prod, s),
-        F::U16 => build_input::<u16>(inp, cfg, prod, s),
-        f => return Err(format!("unsupported input format {f}")),
-    }
-    .map_err(e)?;
-
-    let (output, cast, out_id, out_name) = match out {
-        Output::Device(o) => {
-            let stream = build_output(o, ich, in_rate, cons, gain, shared.clone())?;
-            (Some(stream), None, dev_id(o).unwrap_or_default(), name(o).unwrap_or_default())
-        }
-        Output::Cast(d) => {
-            let session = cast::Session::start(d, in_rate, ich, cons, gain, shared.clone())?;
-            (None, Some(session), d.id(), format!("{} (Cast)", d.name))
+    // Only kept alive: dropping it stops the capture.
+    let input: Box<dyn std::any::Any> = match inp {
+        Input::Device(d) => Box::new(open_input(d, prod, shared.clone())?),
+        Input::PcSound => {
+            let (s, f) = (shared.clone(), shared.clone());
+            let mut prod = prod;
+            Box::new(system::PcSound::start(
+                move |samples| push_input(&mut prod, &s, 2, samples),
+                move || f.failed.store(true, Ordering::Relaxed),
+            )?)
         }
     };
-    input.play().map_err(e)?;
+
+    let (mut output, mut cast, mut recording) = (None, None, None);
+    let (out_id, out_name) = match out {
+        Output::Device(o) => {
+            output = Some(build_output(o, ich, in_rate, cons, gain, shared.clone())?);
+            (dev_id(o).unwrap_or_default(), name(o).unwrap_or_default())
+        }
+        Output::Cast(d) => {
+            cast = Some(cast::Session::start(d, in_rate, ich, cons, gain, shared.clone())?);
+            (d.id(), format!("{} (Cast)", d.name))
+        }
+        // Untouched by volume and mute: the recording is the input as it arrives.
+        Output::Record(t) => {
+            recording = Some(record::Recording::start(t, in_rate, ich, cons)?);
+            (t.id(), t.file_name())
+        }
+    };
     if let Some(o) = &output {
         o.play().map_err(e)?;
     }
@@ -797,9 +930,10 @@ fn start(inp: &cpal::Device, out: Output, gain: Arc<AtomicU32>) -> Result<Runnin
         _input: input,
         _output: output,
         cast,
-        in_id: dev_id(inp).unwrap_or_default(),
+        recording,
+        in_id: inp.id().unwrap_or_default(),
         out_id,
-        in_name: name(inp).unwrap_or_default(),
+        in_name: inp.name(),
         out_name,
         in_rate,
         shared,
@@ -872,16 +1006,73 @@ where
         move |data: &[T], _: &_| {
             scratch.clear();
             scratch.extend(data.iter().map(|&x| f32::from_sample_(x)));
-            shared.in_peak.fetch_max(peak(&scratch).to_bits(), Ordering::Relaxed);
-            // Whole frames only, so channels never get shifted. When full, the newest
-            // audio is dropped.
-            let n = scratch.len().min(prod.vacant_len() / ich * ich);
-            prod.push_slice(&scratch[..n]);
-            shared.dropped.fetch_add(((scratch.len() - n) / ich) as u32, Ordering::Relaxed);
+            push_input(&mut prod, &shared, ich, &scratch);
         },
         fail,
         None,
     )
+}
+
+/// Opens and starts an input device's stream in whatever sample format it captures.
+fn open_input(d: &cpal::Device, prod: ringbuf::HeapProd<f32>, shared: Arc<Shared>) -> Result<cpal::Stream, String> {
+    use cpal::SampleFormat as F;
+    let e = |e: cpal::Error| e.to_string();
+    let icfg = d.default_input_config().map_err(e)?;
+    let cfg = icfg.config();
+    let stream = match icfg.sample_format() {
+        F::F32 => build_input::<f32>(d, cfg, prod, shared),
+        F::I16 => build_input::<i16>(d, cfg, prod, shared),
+        F::I32 => build_input::<i32>(d, cfg, prod, shared),
+        F::U16 => build_input::<u16>(d, cfg, prod, shared),
+        f => return Err(format!("unsupported input format {f}")),
+    }
+    .map_err(e)?;
+    stream.play().map_err(e)?;
+    Ok(stream)
+}
+
+/// Feeds captured samples into the ring buffer and the input meter. Whole frames only, so
+/// channels never get shifted; when full, the newest audio is dropped.
+fn push_input(prod: &mut ringbuf::HeapProd<f32>, shared: &Shared, ich: usize, samples: &[f32]) {
+    shared.in_peak.fetch_max(peak(samples).to_bits(), Ordering::Relaxed);
+    let n = samples.len().min(prod.vacant_len() / ich * ich);
+    prod.push_slice(&samples[..n]);
+    shared.dropped.fetch_add(((samples.len() - n) / ich) as u32, Ordering::Relaxed);
+}
+
+/// After this long without input, `pop_or_silence` supplies silence: PC sound sends nothing
+/// while the PC is quiet, so a cast speaker would run dry (and give up) and a recording's
+/// timeline would shrink.
+const GAP: Duration = Duration::from_millis(100);
+
+/// Pops input into `samples`, or `GAP` worth of silence if `fill` and nothing has arrived
+/// for that long (`heard`: when audio last came). Returns the number of samples, a whole
+/// number of `ich`-channel frames; 0 means nothing to do yet.
+fn pop_or_silence(
+    cons: &mut ringbuf::HeapCons<f32>,
+    samples: &mut [f32],
+    heard: &mut Instant,
+    rate: u32,
+    ich: usize,
+    fill: bool,
+) -> usize {
+    let n = cons.pop_slice(samples);
+    if n > 0 {
+        *heard = Instant::now();
+        return n;
+    }
+    if !fill || heard.elapsed() < GAP {
+        return 0;
+    }
+    *heard = Instant::now();
+    let n = (rate as usize * GAP.as_millis() as usize / 1000 * ich).min(samples.len() / ich * ich);
+    samples[..n].fill(0.0);
+    n
+}
+
+/// 16-bit samples: what recordings and the cast stream store.
+fn to_i16(x: f32) -> i16 {
+    (x.clamp(-1.0, 1.0) * 32767.0) as i16
 }
 
 /// Buffered input the converter aims to keep: enough to ride out callback jitter.
@@ -998,6 +1189,9 @@ struct Settings {
     muted: bool,
     /// Playing when last closed; playback resumes on the next start.
     playing: bool,
+    /// Folder and format (file extension) of the last recording, for the save dialog.
+    record_dir: String,
+    record_format: String,
 }
 
 impl Settings {
@@ -1012,11 +1206,16 @@ impl Settings {
     fn parse(text: &str) -> Self {
         let mut lines = text.lines();
         Self {
-            input: lines.next().unwrap_or_default().to_owned(),
+            // Inputs from before PC sound captured one output device's mix ("loopback:" + ID).
+            input: lines.next().map_or_else(String::new, |i| {
+                if i.starts_with("loopback:") { PC_SOUND_ID.into() } else { i.to_owned() }
+            }),
             output: lines.next().unwrap_or_default().to_owned(),
             volume: lines.next().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.0, 1.0),
             muted: lines.next() == Some("1"),
             playing: lines.next() == Some("1"),
+            record_dir: lines.next().unwrap_or_default().to_owned(),
+            record_format: lines.next().unwrap_or_default().to_owned(),
         }
     }
 
@@ -1024,7 +1223,10 @@ impl Settings {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
             let (muted, playing) = (self.muted as u8, self.playing as u8);
-            let text = format!("{}\n{}\n{}\n{muted}\n{playing}\n", self.input, self.output, self.volume);
+            let text = format!(
+                "{}\n{}\n{}\n{muted}\n{playing}\n{}\n{}\n",
+                self.input, self.output, self.volume, self.record_dir, self.record_format
+            );
             let _ = std::fs::write(p, text);
         }
     }
@@ -1106,20 +1308,13 @@ mod tests {
     }
 
     #[test]
-    fn loopback_into_the_same_output_is_refused() {
-        let spk = "wasapi:{0.0.0.00000000}.{abc}";
-        let looped = format!("{LOOPBACK}{spk}");
-        assert!(loops_back(&looped, Some(spk)));
-        assert!(!loops_back(&looped, Some("wasapi:{0.0.0.00000000}.{other}")));
-        assert!(!loops_back(&looped, Some("cast:Bibliotek")));
-        assert!(!loops_back(spk, Some(spk))); // a microphone-style input, not loopback
-    }
-
-    #[test]
     fn settings_parse_new_and_old_format() {
-        let s = Settings::parse("Mic\nSpeakers\n0.25\n1\n1\n");
+        let s = Settings::parse("Mic\nSpeakers\n0.25\n1\n1\nC:\\Music\nflac\n");
+        assert_eq!((s.record_dir.as_str(), s.record_format.as_str()), ("C:\\Music", "flac"));
         assert_eq!((s.input.as_str(), s.output.as_str(), s.volume, s.muted), ("Mic", "Speakers", 0.25, true));
         assert!(s.playing);
+        let looped = Settings::parse("loopback:wasapi:{0.0.0.00000000}.{abc}\n");
+        assert_eq!(looped.input, PC_SOUND_ID);
         let old = Settings::parse("Mic\n\n");
         assert_eq!((old.output.as_str(), old.volume, old.muted, old.playing), ("", 1.0, false, false));
     }

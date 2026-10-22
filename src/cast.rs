@@ -1,15 +1,15 @@
 //! Casting to Google Cast speakers (Google Home, Nest, Chromecast). Experimental.
 //!
-//! - Discovery: mDNS (`_googlecast._tcp`) via `mdns-sd`; speaker groups included.
+//! - Discovery: one mDNS question (`_googlecast._tcp`) and its replies, parsed here;
+//!   speaker groups included.
 //! - Audio: a Cast speaker plays media from a URL, so `Session` runs a small HTTP server
-//!   that streams the live input as endless 16-bit stereo WAV, and tells the speaker (via
-//!   `oxicast`, Default Media Receiver) to play that URL. The speaker connects back to this
-//!   PC, so the firewall must allow incoming connections to NymPlayer.
-//! - `oxicast` is async; each discovery and each session runs a current-thread tokio
-//!   runtime on its own thread, so the rest of the app stays synchronous.
+//!   that streams the live input as endless 16-bit stereo WAV, and tells the speaker (over
+//!   the Cast v2 protocol, `Channel`, to its Default Media Receiver) to play that URL. The
+//!   speaker connects back to this PC, so the firewall must allow incoming connections.
+//! - Everything is blocking code on its own threads: one for discovery, two per session
+//!   (the HTTP stream and the Cast control channel).
 
 use crate::Shared;
-use oxicast::{CastApp, CastClient, CastEvent, IdleReason, MediaInfo, MediaMetadata};
 use ringbuf::HeapCons;
 use ringbuf::traits::Consumer;
 use std::io::{ErrorKind, Read, Write};
@@ -44,9 +44,6 @@ pub struct Discovery {
 
 /// How long a search listens; speakers usually answer within half a second.
 const SEARCH: Duration = Duration::from_secs(4);
-/// After this long without input, silence is sent instead, so the speaker doesn't run dry
-/// and give up (loopback input sends nothing while the PC is quiet).
-const GAP: Duration = Duration::from_millis(100);
 /// Without a request from the speaker by then, something (usually the firewall) blocks it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -57,10 +54,6 @@ fn secret() -> u64 {
     std::collections::hash_map::RandomState::new().build_hasher().finish()
 }
 
-fn block_on<F: Future>(f: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime").block_on(f)
-}
-
 impl Discovery {
     /// Starts a search unless one is running; calls `changed` whenever the list changes.
     pub fn search(self: &Arc<Self>, changed: impl Fn() + Send + 'static) {
@@ -69,33 +62,125 @@ impl Discovery {
         }
         let this = self.clone();
         std::thread::spawn(move || {
-            // Our own browse, not oxicast's: that one skips answers from an IP it has already
-            // seen, and a speaker group is advertised at one of its speakers' IPs (on another
-            // port), so either the group or that speaker went missing.
-            if let Ok(mdns) = mdns_sd::ServiceDaemon::new()
-                && let Ok(found) = mdns.browse("_googlecast._tcp.local.")
-            {
+            if let Ok(socket) = query_socket() {
                 let deadline = Instant::now() + SEARCH;
-                while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                    let Ok(event) = found.recv_timeout(left) else { break };
-                    if let mdns_sd::ServiceEvent::ServiceResolved(info) = event
-                        && let Some(ip) = info.get_addresses_v4().iter().next()
-                    {
-                        // "fn" is the friendly name people gave the speaker or group.
-                        let name = info.get_property_val_str("fn").unwrap_or(info.get_fullname()).to_string();
-                        let group = info.get_property_val_str("md") == Some("Google Cast Group");
-                        let dev = Device { name, ip: IpAddr::V4(*ip), port: info.get_port(), group };
+                let mut next_query = Instant::now();
+                let mut packet = [0u8; 9000];
+                while Instant::now() < deadline {
+                    // Asked a few times: replies can get lost, and the firewall only lets
+                    // replies in for a few seconds after each question.
+                    if Instant::now() >= next_query {
+                        let _ = socket.send_to(&QUERY, ("224.0.0.251", 5353));
+                        next_query += Duration::from_secs(1);
+                    }
+                    let Ok((n, from)) = socket.recv_from(&mut packet) else { continue };
+                    for dev in parse_reply(&packet[..n], from.ip()) {
                         if add(&mut this.devices.lock().unwrap(), dev) {
                             changed();
                         }
                     }
                 }
-                let _ = mdns.shutdown();
             }
             this.searching.store(false, Ordering::Relaxed);
             changed();
         });
     }
+}
+
+/// mDNS question for Cast devices: PTR `_googlecast._tcp.local`.
+const QUERY: [u8; 40] = *b"\0\0\0\0\0\x01\0\0\0\0\0\0\x0b_googlecast\x04_tcp\x05local\0\0\x0c\0\x01";
+
+/// A socket for asking from a random port ("legacy unicast", RFC 6762 6.7): speakers reply
+/// straight to it, so nothing needs to listen on port 5353 or join the multicast group.
+/// It's bound to the adapter that carries internet traffic, which sends the question there
+/// rather than to a virtual adapter (Hyper-V, VPN).
+// shortcut: only that one adapter is searched; search all adapters if speakers on a second network are needed.
+fn query_socket() -> std::io::Result<UdpSocket> {
+    let probe = UdpSocket::bind(("0.0.0.0", 0))?;
+    probe.connect(("8.8.8.8", 53))?; // no packet is sent; this only picks the route
+    let socket = UdpSocket::bind((probe.local_addr()?.ip(), 0))?;
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    Ok(socket)
+}
+
+/// The Cast devices in one mDNS reply: SRV gives the port (a group's differs from its host
+/// speaker's), TXT the name (`fn`) and model (`md`), A the address (else the sender's).
+fn parse_reply(p: &[u8], from: IpAddr) -> Vec<Device> {
+    use std::collections::HashMap;
+    let (mut srv, mut txt, mut addr) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let count = |i: usize| p.get(i..i + 2).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]) as usize);
+    if p.len() < 12 || p[2] & 0x80 == 0 {
+        return vec![]; // not a response
+    }
+    let mut i = 12;
+    for _ in 0..count(4) {
+        let Some((_, end)) = dns_name(p, i) else { return vec![] };
+        i = end + 4; // type, class
+    }
+    for _ in 0..count(6) + count(8) + count(10) {
+        let Some((owner, end)) = dns_name(p, i) else { break };
+        let (kind, len) = (count(end), count(end + 8));
+        let Some(data) = p.get(end + 10..end + 10 + len) else { break };
+        match kind {
+            1 if len == 4 => _ = addr.insert(owner, IpAddr::from([data[0], data[1], data[2], data[3]])),
+            16 => _ = txt.insert(owner, txt_pairs(data)),
+            33 if len > 6 => {
+                if let Some((target, _)) = dns_name(p, end + 16) {
+                    srv.insert(owner, (target, u16::from_be_bytes([data[4], data[5]])));
+                }
+            }
+            _ => {}
+        }
+        i = end + 10 + len;
+    }
+    let mut found: Vec<_> = srv
+        .into_iter()
+        .filter(|(instance, _)| instance.ends_with("._googlecast._tcp.local"))
+        .map(|(instance, (target, port))| {
+            let t = txt.remove(&instance).unwrap_or_default();
+            let get = |k: &str| t.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+            let name = get("fn").unwrap_or_else(|| instance.split('.').next().unwrap_or_default().to_owned());
+            let group = get("md").as_deref() == Some("Google Cast Group");
+            Device { name, ip: addr.get(&target).copied().unwrap_or(from), port, group }
+        })
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// A DNS name at `i`, following compression pointers; also returns where it ends at `i`.
+fn dns_name(p: &[u8], mut i: usize) -> Option<(String, usize)> {
+    let (mut name, mut end) = (String::new(), None);
+    for _ in 0..64 {
+        let len = *p.get(i)? as usize;
+        if len & 0xC0 == 0xC0 {
+            end.get_or_insert(i + 2);
+            i = (len & 0x3F) << 8 | *p.get(i + 1)? as usize;
+        } else if len == 0 {
+            return Some((name, end.unwrap_or(i + 1)));
+        } else {
+            if !name.is_empty() {
+                name.push('.');
+            }
+            name.push_str(&String::from_utf8_lossy(p.get(i + 1..i + 1 + len)?));
+            i += 1 + len;
+        }
+    }
+    None // a pointer loop
+}
+
+/// TXT record strings as `key=value` pairs.
+fn txt_pairs(mut data: &[u8]) -> Vec<(String, String)> {
+    let mut pairs = vec![];
+    while let Some((&len, rest)) = data.split_first() {
+        let (s, rest) = rest.split_at(rest.len().min(len as usize));
+        let s = String::from_utf8_lossy(s);
+        if let Some((k, v)) = s.split_once('=') {
+            pairs.push((k.to_owned(), v.to_owned()));
+        }
+        data = rest;
+    }
+    pairs
 }
 
 /// Adds a newly found device unless one with that name is listed; keeps the list sorted,
@@ -143,7 +228,7 @@ impl Session {
 
         let (dev, s, end) = (dev.clone(), stop.clone(), ended.clone());
         std::thread::spawn(move || {
-            let reason = block_on(control(&dev, &url, &s, &fetched));
+            let reason = control(&dev, &url, &s, &fetched);
             if !s.load(Ordering::Relaxed) {
                 *end.lock().unwrap() = Some(reason);
             }
@@ -163,51 +248,267 @@ impl Drop for Session {
     }
 }
 
+const NS_CONNECTION: &str = "urn:x-cast:com.google.cast.tp.connection";
+const NS_HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
+const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
+const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
+/// Google's Default Media Receiver, the player app on every Cast device.
+const MEDIA_APP: &str = "CC1AD845";
+
 /// Starts playback on the speaker and watches it until `stop` or the speaker ends it.
-/// Returns the reason it ended.
-async fn control(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> String {
-    let fail = |e: oxicast::Error| format!("Error: casting to {} failed: {e}", dev.name);
-    let client = match CastClient::connect(&dev.ip.to_string(), dev.port).await {
-        Ok(c) => c,
-        Err(e) => return fail(e),
-    };
-    let app = match client.launch_app(&CastApp::DefaultMediaReceiver).await {
-        Ok(a) => a,
-        Err(e) => return fail(e),
-    };
-    let title = MediaMetadata::Generic { title: Some("NymPlayer".into()), subtitle: None, images: vec![] };
-    let media = MediaInfo::live(url, "audio/wav").metadata(title);
-    if let Err(e) = client.load_media(&media, true, 0.0, None).await {
-        return fail(e);
-    }
-    let started = Instant::now();
-    let reason = loop {
-        tokio::select! {
-            ev = client.next_event() => match ev {
-                Some(CastEvent::MediaSessionEnded { idle_reason: IdleReason::Error, .. }) => {
-                    break format!("Error: {} couldn't play the stream", dev.name);
-                }
-                Some(CastEvent::MediaSessionEnded { .. }) => break format!("{} stopped casting", dev.name),
-                Some(CastEvent::Disconnected(_)) | None => break format!("Error: lost connection to {}", dev.name),
-                _ => {}
-            },
-            () = tokio::time::sleep(Duration::from_millis(100)) => {
-                if stop.load(Ordering::Relaxed) {
-                    let _ = client.stop_app(&app.session_id).await;
-                    return String::new();
-                }
-                if !fetched.load(Ordering::Relaxed) && started.elapsed() > CONNECT_TIMEOUT {
-                    let _ = client.stop_app(&app.session_id).await;
-                    break format!(
-                        "Error: {} didn't connect to NymPlayer; allow NymPlayer through the firewall",
-                        dev.name
-                    );
-                }
-            }
+/// Returns the reason it ended (empty when stopped by `stop`).
+fn control(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> String {
+    run(dev, url, stop, fetched).unwrap_or_else(|e| format!("Error: casting to {} failed: {e}", dev.name))
+}
+
+fn run(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> std::io::Result<String> {
+    let mut ch = Channel::open(dev)?;
+    ch.send("receiver-0", NS_CONNECTION, r#"{"type":"CONNECT"}"#)?;
+    ch.send("receiver-0", NS_RECEIVER, &format!(r#"{{"type":"LAUNCH","appId":"{MEDIA_APP}","requestId":1}}"#))?;
+    let launching = Instant::now();
+    let (transport, session) = loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(String::new());
+        }
+        if launching.elapsed() > CONNECT_TIMEOUT {
+            return Err(std::io::Error::other("the speaker didn't start its media player"));
+        }
+        if let Some((ns, json)) = ch.recv()?
+            && ns == NS_RECEIVER
+            && let Some(app) = media_app(&json)
+        {
+            break app;
         }
     };
-    let _ = client.disconnect().await;
-    reason
+    ch.send(&transport, NS_CONNECTION, r#"{"type":"CONNECT"}"#)?;
+    let url = url.replace('"', "");
+    let load = format!(
+        r#"{{"type":"LOAD","requestId":2,"autoplay":true,"media":{{"contentId":"{url}","contentType":"audio/wav","streamType":"LIVE","metadata":{{"metadataType":0,"title":"NymPlayer"}}}}}}"#
+    );
+    ch.send(&transport, NS_MEDIA, &load)?;
+    let started = Instant::now();
+    let stop_app = |ch: &mut Channel| {
+        let json = format!(r#"{{"type":"STOP","requestId":3,"sessionId":"{session}"}}"#);
+        let _ = ch.send("receiver-0", NS_RECEIVER, &json);
+    };
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            stop_app(&mut ch);
+            return Ok(String::new());
+        }
+        if !fetched.load(Ordering::Relaxed) && started.elapsed() > CONNECT_TIMEOUT {
+            stop_app(&mut ch);
+            return Ok(format!(
+                "Error: {} didn't connect to NymPlayer; allow NymPlayer through the firewall",
+                dev.name
+            ));
+        }
+        if let Some((ns, json)) = ch.recv()?
+            && let Some(reason) = ended_by(&ns, &json, &session, &dev.name)
+        {
+            return Ok(reason);
+        }
+    }
+}
+
+/// Whether this message from the speaker ends the cast, and why.
+fn ended_by(ns: &str, json: &str, session: &str, name: &str) -> Option<String> {
+    let kind = json_str(json, "type")?;
+    match (ns, kind) {
+        (NS_MEDIA, "LOAD_FAILED") => Some(format!("Error: {name} couldn't play the stream")),
+        // IDLE without a reason is the state before playback starts.
+        (NS_MEDIA, "MEDIA_STATUS") => match json_str(json, "idleReason")? {
+            "ERROR" => Some(format!("Error: {name} couldn't play the stream")),
+            _ => Some(format!("{name} stopped casting")),
+        },
+        // Our media player was closed, e.g. "Hey Google, stop".
+        (NS_RECEIVER, "RECEIVER_STATUS") if !json.contains(session) => Some(format!("{name} stopped casting")),
+        (NS_CONNECTION, "CLOSE") => Some(format!("{name} stopped casting")),
+        _ => None,
+    }
+}
+
+/// The media player's transport ID and session ID, once a RECEIVER_STATUS lists it.
+fn media_app(json: &str) -> Option<(String, String)> {
+    if json_str(json, "type")? != "RECEIVER_STATUS" {
+        return None;
+    }
+    // The fields after its appId belong to the same app entry.
+    let app = &json[json.find(&format!(r#""appId":"{MEDIA_APP}""#))?..];
+    Some((json_str(app, "transportId")?.to_owned(), json_str(app, "sessionId")?.to_owned()))
+}
+
+/// The first string value of `key` in compact JSON, as Cast devices send it. Enough for
+/// the few IDs and states read here, whose values have no escapes.
+fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let rest = json[json.find(&format!(r#""{key}":"#))? + key.len() + 3..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(&rest[..rest.find('"')?])
+}
+
+/// A Cast v2 connection: TLS to the speaker, each message a 4-byte length and a protobuf
+/// `CastMessage` carrying JSON text. Answers the speaker's heartbeat pings.
+struct Channel {
+    tls: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    inbox: Vec<u8>,
+    pinged: Instant,
+}
+
+impl Channel {
+    fn open(dev: &Device) -> std::io::Result<Self> {
+        let other = std::io::Error::other;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(other)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SelfSigned(provider)))
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::IpAddress(dev.ip.into());
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(other)?;
+        let mut tcp = TcpStream::connect_timeout(&(dev.ip, dev.port).into(), Duration::from_secs(5))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut tcp)?;
+        }
+        // Short from now on, so `recv` returns often enough to check for Stop.
+        tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
+        Ok(Self { tls: rustls::StreamOwned::new(conn, tcp), inbox: vec![], pinged: Instant::now() })
+    }
+
+    fn send(&mut self, dest: &str, ns: &str, json: &str) -> std::io::Result<()> {
+        let msg = cast_message("sender-0", dest, ns, json);
+        self.tls.write_all(&(msg.len() as u32).to_be_bytes())?;
+        self.tls.write_all(&msg)?;
+        self.tls.flush()
+    }
+
+    /// The next message (namespace, JSON) if one arrives within the read timeout.
+    fn recv(&mut self) -> std::io::Result<Option<(String, String)>> {
+        // The speaker drops connections that stay quiet for long.
+        if self.pinged.elapsed() > Duration::from_secs(5) {
+            self.pinged = Instant::now();
+            self.send("receiver-0", NS_HEARTBEAT, r#"{"type":"PING"}"#)?;
+        }
+        loop {
+            if let Some(len) = self.inbox.get(..4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                && self.inbox.len() >= 4 + len
+            {
+                let msg: Vec<u8> = self.inbox.drain(..4 + len).skip(4).collect();
+                let Some((ns, json)) = read_cast_message(&msg) else { continue };
+                if ns == NS_HEARTBEAT && json_str(&json, "type") == Some("PING") {
+                    self.send("receiver-0", NS_HEARTBEAT, r#"{"type":"PONG"}"#)?;
+                    continue;
+                }
+                return Ok(Some((ns, json)));
+            }
+            let mut buf = [0u8; 4096];
+            match self.tls.read(&mut buf) {
+                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                Ok(n) => self.inbox.extend(&buf[..n]),
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Cast devices use self-signed certificates, so there's no chain to check (Google's own
+/// senders don't either); the handshake signature is still verified.
+#[derive(Debug)]
+struct SelfSigned(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for SelfSigned {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A protobuf `CastMessage`: protocol version 0, source, destination, namespace, payload
+/// type 0 (text) and the JSON payload (fields 1 to 6).
+fn cast_message(source: &str, dest: &str, ns: &str, json: &str) -> Vec<u8> {
+    let mut m = vec![1 << 3, 0];
+    for (field, s) in [(2u8, source), (3, dest), (4, ns)] {
+        text_field(&mut m, field, s);
+    }
+    m.extend([5 << 3, 0]);
+    text_field(&mut m, 6, json);
+    m
+}
+
+fn text_field(m: &mut Vec<u8>, field: u8, s: &str) {
+    m.push(field << 3 | 2);
+    let mut n = s.len();
+    while n >= 0x80 {
+        m.push(n as u8 | 0x80);
+        n >>= 7;
+    }
+    m.push(n as u8);
+    m.extend(s.as_bytes());
+}
+
+/// Namespace and JSON payload of a protobuf `CastMessage`; other fields are skipped.
+fn read_cast_message(mut m: &[u8]) -> Option<(String, String)> {
+    fn varint(m: &mut &[u8]) -> Option<usize> {
+        let mut v = 0usize;
+        for shift in (0..64).step_by(7) {
+            let (&b, rest) = m.split_first()?;
+            *m = rest;
+            v |= ((b & 0x7f) as usize) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    let (mut ns, mut json) = (None, None);
+    while !m.is_empty() {
+        let key = varint(&mut m)?;
+        match key & 7 {
+            0 => _ = varint(&mut m)?,
+            2 => {
+                let len = varint(&mut m)?;
+                let (value, rest) = (m.get(..len)?, m.get(len..)?);
+                m = rest;
+                match key >> 3 {
+                    4 => ns = Some(String::from_utf8_lossy(value).into_owned()),
+                    6 => json = Some(String::from_utf8_lossy(value).into_owned()),
+                    _ => {}
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some((ns?, json?))
 }
 
 /// The HTTP side: answers each request for `path` with an endless WAV stream of the live
@@ -239,14 +540,7 @@ fn serve(
             cons.clear(); // start from live audio, not what piled up while waiting
             conn = send_headers(c, rate).ok();
         }
-        let mut n = cons.pop_slice(&mut samples);
-        if n > 0 {
-            heard = Instant::now();
-        } else if conn.is_some() && heard.elapsed() >= GAP {
-            n = (rate as usize * GAP.as_millis() as usize / 1000 * ich).min(samples.len());
-            samples[..n].fill(0.0);
-            heard = Instant::now();
-        }
+        let n = crate::pop_or_silence(&mut cons, &mut samples, &mut heard, rate, ich, conn.is_some());
         let Some(c) = conn.as_mut().filter(|_| n > 0) else {
             std::thread::sleep(Duration::from_millis(5));
             continue;
@@ -259,7 +553,7 @@ fn serve(
             for ch in 0..2 {
                 let x = (frame[ch.min(ich - 1)] * g).clamp(-1.0, 1.0);
                 peak = peak.max(x.abs());
-                bytes.extend(((x * 32767.0) as i16).to_le_bytes());
+                bytes.extend(crate::to_i16(x).to_le_bytes());
             }
         }
         shared.out_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
@@ -317,6 +611,92 @@ mod tests {
     use super::*;
     use ringbuf::HeapRb;
     use ringbuf::traits::{Producer, Split};
+
+    /// A reply laid out like a speaker group's: the question, then PTR, SRV (with a
+    /// compressed target), TXT and A records.
+    #[test]
+    fn parses_an_mdns_reply() {
+        let mut p = vec![0, 0, 0x84, 0, 0, 1, 0, 1, 0, 0, 0, 3];
+        p.extend(&QUERY[12..]); // the question, `_googlecast._tcp.local` at offset 12
+        let name = |p: &mut Vec<u8>, labels: &[&str], tail: u16| {
+            labels.iter().for_each(|l| {
+                p.push(l.len() as u8);
+                p.extend(l.as_bytes());
+            });
+            p.extend((0xC000 | tail).to_be_bytes());
+        };
+        let record = |p: &mut Vec<u8>, kind: u16, data: &[u8]| {
+            p.extend(kind.to_be_bytes());
+            p.extend([0x80, 1, 0, 0, 0, 120]); // class IN (cache flush), TTL
+            p.extend((data.len() as u16).to_be_bytes());
+            p.extend(data);
+        };
+        // PTR -> "Google-Cast-Group-1._googlecast._tcp.local"
+        let mut ptr = vec![];
+        name(&mut ptr, &["Google-Cast-Group-1"], 12);
+        p.extend([0xC0, 12]);
+        record(&mut p, 12, &ptr);
+        let instance = p.len() - ptr.len(); // the instance name inside the PTR data
+        // SRV: port 32109, target "host-1.local" (written out; ends in a pointer to "local")
+        let local = 12 + 1 + 11 + 1 + 4; // "local" inside the question name
+        let mut srv = vec![0, 0, 0, 0, 0x7d, 0x6d];
+        name(&mut srv, &["host-1"], local as u16);
+        p.extend((0xC000 | instance as u16).to_be_bytes());
+        record(&mut p, 33, &srv);
+        let target = p.len() - srv.len() + 6;
+        // TXT: id=..., fn=Kök Och Matrum, md=Google Cast Group
+        let mut txt = vec![];
+        for s in ["id=abc", "fn=Kök Och Matrum", "md=Google Cast Group"] {
+            txt.push(s.len() as u8);
+            txt.extend(s.as_bytes());
+        }
+        p.extend((0xC000 | instance as u16).to_be_bytes());
+        record(&mut p, 16, &txt);
+        // A: host-1.local -> 192.168.1.122
+        p.extend((0xC000 | target as u16).to_be_bytes());
+        record(&mut p, 1, &[192, 168, 1, 122]);
+
+        let found = parse_reply(&p, [10, 0, 0, 1].into());
+        let ip: IpAddr = [192, 168, 1, 122].into();
+        assert_eq!(found, [Device { name: "Kök Och Matrum".into(), ip, port: 32109, group: true }]);
+        // Not a response (a question from someone else): ignored.
+        assert!(parse_reply(&QUERY, ip).is_empty());
+        // Truncated or garbage packets don't panic.
+        for n in 0..p.len() {
+            parse_reply(&p[..n], ip);
+        }
+    }
+
+    #[test]
+    fn cast_message_round_trip() {
+        let m = cast_message("sender-0", "receiver-0", NS_RECEIVER, &"x".repeat(300));
+        assert_eq!(&m[..4], [0x08, 0, 0x12, 8]); // version 0, then source "sender-0"
+        assert_eq!(read_cast_message(&m), Some((NS_RECEIVER.to_owned(), "x".repeat(300))));
+        assert_eq!(read_cast_message(&m[..m.len() - 1]), None); // truncated
+    }
+
+    /// As a Nest Hub sends it: a backdrop app listed before the media player.
+    #[test]
+    fn finds_the_media_player_session() {
+        let status = r#"{"type":"RECEIVER_STATUS","requestId":1,"status":{"applications":[{"appId":"E8C28D3C","sessionId":"backdrop","transportId":"backdrop-t"},{"appId":"CC1AD845","appType":"WEB","displayName":"Default Media Receiver","namespaces":[{"name":"urn:x-cast:com.google.cast.media"}],"sessionId":"abc-123","statusText":"Ready","transportId":"abc-t"}],"volume":{"level":0.5}}}"#;
+        assert_eq!(media_app(status), Some(("abc-t".into(), "abc-123".into())));
+        assert_eq!(media_app(r#"{"type":"RECEIVER_STATUS","status":{"applications":[]}}"#), None);
+    }
+
+    #[test]
+    fn recognises_the_end_of_a_cast() {
+        let ended = |ns, json| ended_by(ns, json, "abc-123", "Kontor");
+        let idle = r#"{"type":"MEDIA_STATUS","status":[{"playerState":"IDLE","idleReason":"CANCELLED"}]}"#;
+        assert_eq!(ended(NS_MEDIA, idle).as_deref(), Some("Kontor stopped casting"));
+        let error = r#"{"type":"MEDIA_STATUS","status":[{"playerState":"IDLE","idleReason":"ERROR"}]}"#;
+        assert_eq!(ended(NS_MEDIA, error).as_deref(), Some("Error: Kontor couldn't play the stream"));
+        let playing = r#"{"type":"MEDIA_STATUS","status":[{"playerState":"PLAYING"}]}"#;
+        assert_eq!(ended(NS_MEDIA, playing), None);
+        let closed = r#"{"type":"RECEIVER_STATUS","status":{"applications":[]}}"#;
+        assert_eq!(ended(NS_RECEIVER, closed).as_deref(), Some("Kontor stopped casting"));
+        let ours = r#"{"type":"RECEIVER_STATUS","status":{"applications":[{"sessionId":"abc-123"}]}}"#;
+        assert_eq!(ended(NS_RECEIVER, ours), None);
+    }
 
     #[test]
     fn group_and_its_host_speaker_are_both_listed() {

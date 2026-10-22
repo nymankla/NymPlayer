@@ -4,6 +4,19 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-22
+
+### Added
+- Record the input to a WAV or FLAC file ([#1](https://github.com/nymankla/NymPlayer/issues/1)): a record button next to Play opens a save dialog. While recording, nothing else plays, and the input is saved untouched by volume and mute. Quiet stretches are kept as silence, and the last folder and format are remembered. If the input changes mid-recording, the recording stops and the file is kept.
+
+- Downloads for macOS (Apple Silicon) and Linux (x64) in every release, alongside Windows. They're untested with real audio hardware.
+
+### Changed
+- Smaller downloads: 7.7 MB instead of 10.2 MB. Published builds optimize dependencies for size (NymPlayer's own audio code and the resampler stay optimized for speed). NymPlayer now does its own speaker search and Cast control connection, replacing three libraries (mdns-sd, oxicast, tokio) and a second crypto library.
+- The speaker search only asks on the network adapter used for internet traffic, so virtual adapters (Hyper-V, VPN) no longer get in the way.
+- The CI workflow only runs when started by hand. Releases build and test on all three systems themselves.
+- "What plays on …" inputs are replaced by **"All PC sound (except NymPlayer)"**, which captures other programs' sound before the Windows volume and the sound driver's effects (process loopback). The old inputs were quiet and dull on many laptops: they captured after the volume slider and effects such as Dolby. NymPlayer's own sound is left out, so the feedback guard is no longer needed. Saved settings move to the new input automatically.
+
 ## [0.3.0] - 2026-10-14
 
 ### Added
@@ -59,7 +72,8 @@ First release.
 - Only one copy runs at a time; starting it again brings the running copy to the front.
 - Record-player icon.
 
-[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/nymankla/NymPlayer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nymankla/NymPlayer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nymankla/NymPlayer/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/nymankla/NymPlayer/compare/v0.1.1...v0.1.2

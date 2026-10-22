@@ -2,6 +2,7 @@ name: Release
 
 # Push a tag matching the Cargo.toml version to publish a release:
 #   git tag v0.1.0 && git push origin v0.1.0
+# Builds and tests on Windows, macOS and Linux, then publishes all three downloads.
 on:
   push:
     tags: ["v*"]
@@ -14,8 +15,19 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  release:
-    runs-on: windows-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          # Apple Silicon; GitHub's Intel macOS runners are being retired.
+          - os: macos-latest
+            name: macos-arm64
+          # The oldest supported Ubuntu, so the binary also runs on newer distributions.
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,14 +42,40 @@ jobs:
             exit 1
           fi
 
+      - name: Install Linux libraries (ALSA, GTK for the tray crate)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libxkbcommon-dev
+
       - run: cargo test
       - run: cargo build --profile dist
 
-      - name: Create release
+      # Windows: the bare .exe. macOS/Linux: a .tar.gz, which keeps the executable bit.
+      - name: Package
         shell: bash
+        run: |
+          base="NymPlayer-$GITHUB_REF_NAME-${{ matrix.name }}"
+          mkdir dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/dist/nymplayer.exe "dist/$base.exe"
+          else
+            tar -czf "dist/$base.tar.gz" -C target/dist nymplayer
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          asset="NymPlayer-$GITHUB_REF_NAME-windows-x64.exe"
-          cp target/dist/nymplayer.exe "$asset"
-          gh release create "$GITHUB_REF_NAME" "$asset" --title "NymPlayer $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "NymPlayer $GITHUB_REF_NAME" --generate-notes

@@ -3,7 +3,9 @@
 //! - `single_instance() -> Option<ShowRequests>`, `ShowRequests::watch`
 //! - `autostart()`, `set_autostart(on)`, `AUTOSTART_LABEL` (`None` hides the option)
 //! - `tray_icon()`, `config_dir()`, `DEFAULT_DEVICE_LABEL`
-//! - `LOOPBACK`: whether output devices can be used as inputs (recording what plays)
+//! - `PC_SOUND` (input label, `None` if unsupported), `PC_SOUND_RATE`, `PcSound::start`:
+//!   capture everything the PC plays except NymPlayer
+//! - `local_timestamp()`: local date and time for file names, "2026-10-22 14-05"
 
 #[cfg(windows)]
 mod windows;

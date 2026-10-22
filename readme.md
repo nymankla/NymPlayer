@@ -49,9 +49,26 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 - **One copy at a time.** Starting NymPlayer again brings the running copy to the front.
 - **Automatic device switching**, also while minimized. If the chosen device is unplugged, playback moves to the Windows default and switches back when the device returns. "Windows default" follows changes to the system default.
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
-- **Play what the PC plays** (loopback). The Input list also offers each output device as *"What plays on …"*: everything the PC plays through it, such as music, videos or games. Combined with casting, it sends the PC's sound to your Google speakers. Looping a device back into itself would echo endlessly, so NymPlayer refuses that combination: choose another output or cast.
+- **Record to a file.** The round red button next to Play records the input to a WAV or FLAC file. See [Recording](#recording).
+- **All PC sound.** The Input list offers *"All PC sound (except NymPlayer)"*: everything other programs play, such as music, videos or games. It's a clean digital copy at full level, unaffected by the Windows volume and sound effects like Dolby. Combine it with casting to send the PC's sound to your Google speakers, or record it. NymPlayer's own sound is left out, so there's no echo. Requires Windows 11; it isn't available on Windows 10.
 - **Cast to Google speakers** (experimental). Click the cast icon at the top right to find Google Home, Nest and Chromecast speakers and speaker groups on your network, and pick one to play there instead of on this PC. See [Casting](#casting-experimental).
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.
+
+## Recording
+
+1. Choose the **Input** to record. This can be your USB interface, a microphone, or *"All PC sound"* to record what the PC plays.
+2. Press the round **record button** next to Play, and choose a file name, folder and type in the save dialog:
+   - **WAV**: uncompressed, opens everywhere.
+   - **FLAC**: lossless at about half the size.
+3. While recording, the status shows the elapsed time. **Nothing else plays**: no speakers and no casting, only the file.
+4. Press the button again (now a square) to stop. The file is finished and ready to open, and NymPlayer goes back to what it was doing before.
+
+Good to know:
+- **Recorded as it comes in:** files are 16-bit, at the input's own sample rate and channel count. Volume and Mute don't affect them.
+- **Silence stays in the timeline:** quiet stretches are recorded as silence, so the file matches real time even with *"All PC sound"*, which sends nothing while the PC is quiet.
+- **Remembered:** the folder and file type you used last.
+- **Never overwritten:** if the input device disappears or fails mid-recording, NymPlayer stops and keeps the file rather than starting over. A write error such as a full disk also keeps what was recorded and is shown in the status line.
+- **Length limit:** WAV files are limited to 4 GB, about 6 hours of 48 kHz stereo. Use FLAC for longer recordings.
 
 ## Casting (experimental)
 
@@ -68,7 +85,25 @@ Things to know:
 
 ## macOS and Linux
 
-NymPlayer is prepared for macOS and Linux: the code builds and its tests pass on both in CI, and all Windows-specific code is isolated in `src/system/`. It hasn't been run with real audio hardware there, though, because I don't have a Mac or a Linux machine to test on. On those systems there's currently no single-instance check, no autostart and no tray icon.
+Each release also has downloads for **macOS (Apple Silicon)** and **Linux (x64)**. They're built and tested automatically, but **they haven't been run with real audio hardware**, because I don't have a Mac or a Linux machine to test on. On those systems there's currently no single-instance check, no autostart, no tray icon and no "All PC sound" input.
+
+**macOS:** download `NymPlayer-vX.Y.Z-macos-arm64.tar.gz` and double-click it to unpack `nymplayer`. The app isn't signed, so macOS blocks it at first. To allow it, open Terminal in that folder and run:
+
+```sh
+xattr -d com.apple.quarantine nymplayer
+./nymplayer
+```
+
+macOS asks for microphone access the first time NymPlayer records from an input. When it's started from Terminal, the request is made for Terminal.
+
+**Linux:** download `NymPlayer-vX.Y.Z-linux-x64.tar.gz`, then unpack and run it:
+
+```sh
+tar -xzf NymPlayer-*-linux-x64.tar.gz
+./nymplayer
+```
+
+It needs ALSA, GTK 3 and libappindicator, which most desktop distributions already have. On Debian or Ubuntu: `sudo apt install libasound2 libgtk-3-0 libxdo3 libayatana-appindicator3-1`. Audio goes through ALSA, so on PipeWire or PulseAudio systems, choose the "default" device.
 
 **Help is very welcome!** If you have a Mac or a Linux machine with an audio interface, please try it, report what works and what doesn't, or implement the missing parts in `src/system/other.rs`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -90,7 +125,7 @@ Run the tests with `cargo test`.
 - Devices are remembered by their Windows device ID, so identical devices are told apart; the dropdown numbers them, e.g. "USB Codec (2)". If you plug a USB device into a different port, Windows may give it a new ID, and you'll need to select it again.
 - The icon is generated by `assets/make_icon.py` (Python standard library only).
 
-Built with [cpal](https://github.com/RustAudio/cpal) for audio, [oxicast](https://github.com/denniskribl/oxicast) for casting, [egui/eframe](https://github.com/emilk/egui) for the GUI, [rubato](https://github.com/HEnquist/rubato) for resampling, and [ringbuf](https://github.com/agerasev/ringbuf).
+Built with [cpal](https://github.com/RustAudio/cpal) for audio, [hound](https://github.com/ruuda/hound) and [flacenc](https://github.com/yotarok/flacenc-rs) for recording, [rfd](https://github.com/PolyMeilex/rfd) for the save dialog, [rustls](https://github.com/rustls/rustls) for the Cast connection, [wasapi](https://github.com/HEnquist/wasapi-rs) for capturing the PC sound, [egui/eframe](https://github.com/emilk/egui) for the GUI, [rubato](https://github.com/HEnquist/rubato) for resampling, and [ringbuf](https://github.com/agerasev/ringbuf).
 
 ## License
 
