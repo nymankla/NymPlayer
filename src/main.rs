@@ -687,16 +687,21 @@ fn cast_icon(ui: &mut egui::Ui, active: bool) -> egui::Response {
     r
 }
 
-/// Round record button: a red dot, or a red square ("stop") while recording.
+/// The Record button (white dot on red), labelled Stop with a red square while recording.
 fn record_button(ui: &mut egui::Ui, recording: bool) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::click());
+    let (label, fill) = if recording { ("Stop", egui::Color32::from_rgb(70, 70, 80)) } else { ("Record", ACCENT) };
+    // Room on the left for the icon, painted below since egui's fonts lack ● and ■.
+    let text = egui::RichText::new(format!("     {label}")).size(18.0).strong().color(egui::Color32::WHITE);
+    let button = egui::Button::new(text).fill(fill).corner_radius(18).min_size(egui::vec2(120.0, 36.0));
+    let r = ui.add(button);
+    // Screen readers and UI Automation get the label without the padding.
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let icon = r.rect.left_center() + egui::vec2(24.0, 0.0);
     let p = ui.painter();
-    let bg = if r.hovered() { egui::Color32::from_rgb(85, 85, 96) } else { egui::Color32::from_rgb(70, 70, 80) };
-    p.circle_filled(rect.center(), 18.0, bg);
     if recording {
-        p.rect_filled(egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0)), 2, ACCENT);
+        p.rect_filled(egui::Rect::from_center_size(icon, egui::vec2(12.0, 12.0)), 2, ACCENT);
     } else {
-        p.circle_filled(rect.center(), 8.0, ACCENT);
+        p.circle_filled(icon, 7.0, egui::Color32::WHITE);
     }
     r
 }

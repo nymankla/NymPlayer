@@ -4,6 +4,11 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Changed
+- NymPlayer always plays: the Play/Stop button (and the tray menu's Play/Stop) is gone, and audio passes through as soon as the app starts. Use Mute to silence it.
+- When a Google speaker ends the cast (for example "Hey Google, stop"), NymPlayer goes back to playing on this PC instead of stopping, and the status line says why.
+- The record button is now a labelled **Record** button, which turns into **Stop** while recording.
+
 ## [0.4.0] - 2026-10-22
 
 ### Added

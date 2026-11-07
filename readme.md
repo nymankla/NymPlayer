@@ -49,7 +49,7 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 - **One copy at a time.** Starting NymPlayer again brings the running copy to the front.
 - **Automatic device switching**, also while minimized. If the chosen device is unplugged, playback moves to the Windows default and switches back when the device returns. "Windows default" follows changes to the system default.
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
-- **Record to a file.** The round red button records the input to a WAV or FLAC file. See [Recording](#recording).
+- **Record to a file.** The **Record** button records the input to a WAV or FLAC file. See [Recording](#recording).
 - **All PC sound.** The Input list offers *"All PC sound (except NymPlayer)"*: everything other programs play, such as music, videos or games. It's a clean digital copy at full level, unaffected by the Windows volume and sound effects like Dolby. Combine it with casting to send the PC's sound to your Google speakers, or record it. NymPlayer's own sound is left out, so there's no echo. Requires Windows 11; it isn't available on Windows 10.
 - **Cast to Google speakers** (experimental). Click the cast icon at the top right to find Google Home, Nest and Chromecast speakers and speaker groups on your network, and pick one to play there instead of on this PC. See [Casting](#casting-experimental).
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.
@@ -57,11 +57,11 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 ## Recording
 
 1. Choose the **Input** to record. This can be your USB interface, a microphone, or *"All PC sound"* to record what the PC plays.
-2. Press the round **record button**, and choose a file name, folder and type in the save dialog:
+2. Press **Record**, and choose a file name, folder and type in the save dialog:
    - **WAV**: uncompressed, opens everywhere.
    - **FLAC**: lossless at about half the size.
 3. While recording, the status shows the elapsed time. **Nothing else plays**: no speakers and no casting, only the file.
-4. Press the button again (now a square) to stop. The file is finished and ready to open, and NymPlayer goes back to what it was doing before.
+4. Press the button again (now **Stop**) to stop. The file is finished and ready to open, and NymPlayer goes back to what it was doing before.
 
 Good to know:
 - **Recorded as it comes in:** files are 16-bit, at the input's own sample rate and channel count. Volume and Mute don't affect them.
