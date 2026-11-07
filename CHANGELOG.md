@@ -4,6 +4,9 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+- Casting debug log: start NymPlayer with `NYMPLAYER_CAST_LOG=<file>` to log the speaker search, every Cast message and each stream request, to track down speaker-group problems.
+
 ## [0.5.0] - 2026-11-07
 
 ### Changed

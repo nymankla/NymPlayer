@@ -11,12 +11,42 @@
 
 use crate::Shared;
 use ringbuf::HeapCons;
-use ringbuf::traits::Consumer;
+use ringbuf::traits::{Consumer, Observer};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Debug log of the whole cast flow (search, Cast messages, HTTP requests, stream stats),
+/// appended to the file named by `NYMPLAYER_CAST_LOG`. Nothing is logged without it.
+static LOG: std::sync::OnceLock<Option<(Instant, Mutex<std::fs::File>)>> = std::sync::OnceLock::new();
+
+fn log_file() -> Option<&'static (Instant, Mutex<std::fs::File>)> {
+    LOG.get_or_init(|| {
+        let path = std::env::var_os("NYMPLAYER_CAST_LOG")?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let _ = writeln!(f, "\n=== NymPlayer {} cast log, unix time {} ===", env!("CARGO_PKG_VERSION"), unix.as_secs());
+        Some((Instant::now(), Mutex::new(f)))
+    })
+    .as_ref()
+}
+
+fn logging() -> bool {
+    log_file().is_some()
+}
+
+/// One log line: seconds since the log started, the area, the message.
+fn log(area: &str, msg: std::fmt::Arguments) {
+    if let Some((t0, f)) = log_file() {
+        let _ = writeln!(f.lock().unwrap(), "{:9.3} {area:<6} {msg}", t0.elapsed().as_secs_f64());
+    }
+}
+
+macro_rules! clog {
+    ($area:expr, $($arg:tt)*) => { log($area, format_args!($($arg)*)) };
+}
 
 /// A speaker (or speaker group) found on the network.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,24 +92,36 @@ impl Discovery {
         }
         let this = self.clone();
         std::thread::spawn(move || {
-            if let Ok(socket) = query_socket() {
-                let deadline = Instant::now() + SEARCH;
-                let mut next_query = Instant::now();
-                let mut packet = [0u8; 9000];
-                while Instant::now() < deadline {
-                    // Asked a few times: replies can get lost, and the firewall only lets
-                    // replies in for a few seconds after each question.
-                    if Instant::now() >= next_query {
-                        let _ = socket.send_to(&QUERY, ("224.0.0.251", 5353));
-                        next_query += Duration::from_secs(1);
-                    }
-                    let Ok((n, from)) = socket.recv_from(&mut packet) else { continue };
-                    for dev in parse_reply(&packet[..n], from.ip()) {
-                        if add(&mut this.devices.lock().unwrap(), dev) {
-                            changed();
+            match query_socket() {
+                Ok(socket) => {
+                    clog!("mdns", "search from {:?}", socket.local_addr());
+                    let deadline = Instant::now() + SEARCH;
+                    let mut next_query = Instant::now();
+                    let mut packet = [0u8; 9000];
+                    while Instant::now() < deadline {
+                        // Asked a few times: replies can get lost, and the firewall only lets
+                        // replies in for a few seconds after each question.
+                        if Instant::now() >= next_query {
+                            let sent = socket.send_to(&QUERY, ("224.0.0.251", 5353));
+                            clog!("mdns", "question sent: {sent:?}");
+                            next_query += Duration::from_secs(1);
+                        }
+                        let Ok((n, from)) = socket.recv_from(&mut packet) else { continue };
+                        let found = parse_reply(&packet[..n], from.ip());
+                        clog!("mdns", "reply from {from}, {n} bytes, {} cast device(s)", found.len());
+                        for dev in found {
+                            if add(&mut this.devices.lock().unwrap(), dev) {
+                                changed();
+                            }
                         }
                     }
+                    let list = this.devices.lock().unwrap();
+                    clog!("mdns", "search done, {} device(s):", list.len());
+                    for d in list.iter() {
+                        clog!("mdns", "  {:?} {}:{} group={}", d.name, d.ip, d.port, d.group);
+                    }
                 }
+                Err(e) => clog!("mdns", "no search socket: {e}"),
             }
             this.searching.store(false, Ordering::Relaxed);
             changed();
@@ -138,6 +180,7 @@ fn parse_reply(p: &[u8], from: IpAddr) -> Vec<Device> {
         .filter(|(instance, _)| instance.ends_with("._googlecast._tcp.local"))
         .map(|(instance, (target, port))| {
             let t = txt.remove(&instance).unwrap_or_default();
+            clog!("mdns", "  {instance} -> {target}:{port} at {:?}, txt {t:?}", addr.get(&target));
             let get = |k: &str| t.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
             let name = get("fn").unwrap_or_else(|| instance.split('.').next().unwrap_or_default().to_owned());
             let group = get("md").as_deref() == Some("Google Cast Group");
@@ -219,6 +262,7 @@ impl Session {
         // A secret path, so other devices on the network can't listen in or take the stream over.
         let path = format!("/nymplayer-{:016x}.wav", secret());
         let url = format!("http://{}{path}", listener.local_addr().map_err(e)?);
+        clog!("cast", "start: {dev:?}, input {rate} Hz {ich} ch, serving {url}");
 
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
@@ -229,6 +273,7 @@ impl Session {
         let (dev, s, end) = (dev.clone(), stop.clone(), ended.clone());
         std::thread::spawn(move || {
             let reason = control(&dev, &url, &s, &fetched);
+            clog!("cast", "ended: {reason:?} (stopped by NymPlayer: {})", s.load(Ordering::Relaxed));
             if !s.load(Ordering::Relaxed) {
                 *end.lock().unwrap() = Some(reason);
             }
@@ -244,6 +289,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        clog!("cast", "stop requested by NymPlayer");
         self.stop.store(true, Ordering::Relaxed);
     }
 }
@@ -252,6 +298,8 @@ const NS_CONNECTION: &str = "urn:x-cast:com.google.cast.tp.connection";
 const NS_HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
 const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
 const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
+/// Speaker groups: asked for their members only when logging.
+const NS_MULTIZONE: &str = "urn:x-cast:com.google.cast.multizone";
 /// Google's Default Media Receiver, the player app on every Cast device.
 const MEDIA_APP: &str = "CC1AD845";
 
@@ -264,6 +312,11 @@ fn control(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> 
 fn run(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> std::io::Result<String> {
     let mut ch = Channel::open(dev)?;
     ch.send("receiver-0", NS_CONNECTION, r#"{"type":"CONNECT"}"#)?;
+    if logging() {
+        // Diagnostics only: which speakers the group has, and the device's state before we start.
+        ch.send("receiver-0", NS_MULTIZONE, r#"{"type":"GET_STATUS","requestId":90}"#)?;
+        ch.send("receiver-0", NS_RECEIVER, r#"{"type":"GET_STATUS","requestId":91}"#)?;
+    }
     ch.send("receiver-0", NS_RECEIVER, &format!(r#"{{"type":"LAUNCH","appId":"{MEDIA_APP}","requestId":1}}"#))?;
     let launching = Instant::now();
     let (transport, session) = loop {
@@ -287,6 +340,8 @@ fn run(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> std:
     );
     ch.send(&transport, NS_MEDIA, &load)?;
     let started = Instant::now();
+    let mut status_asked = Instant::now();
+    let mut request_id = 100;
     let stop_app = |ch: &mut Channel| {
         let json = format!(r#"{{"type":"STOP","requestId":3,"sessionId":"{session}"}}"#);
         let _ = ch.send("receiver-0", NS_RECEIVER, &json);
@@ -302,6 +357,14 @@ fn run(dev: &Device, url: &str, stop: &AtomicBool, fetched: &AtomicBool) -> std:
                 "Error: {} didn't connect to NymPlayer; allow NymPlayer through the firewall",
                 dev.name
             ));
+        }
+        // Diagnostics only: the player's and the group's state over time.
+        if logging() && status_asked.elapsed() > Duration::from_secs(10) {
+            status_asked = Instant::now();
+            request_id += 1;
+            ch.send(&transport, NS_MEDIA, &format!(r#"{{"type":"GET_STATUS","requestId":{request_id}}}"#))?;
+            request_id += 1;
+            ch.send("receiver-0", NS_MULTIZONE, &format!(r#"{{"type":"GET_STATUS","requestId":{request_id}}}"#))?;
         }
         if let Some((ns, json)) = ch.recv()?
             && let Some(reason) = ended_by(&ns, &json, &session, &dev.name)
@@ -366,17 +429,24 @@ impl Channel {
             .with_no_client_auth();
         let name = rustls::pki_types::ServerName::IpAddress(dev.ip.into());
         let mut conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(other)?;
-        let mut tcp = TcpStream::connect_timeout(&(dev.ip, dev.port).into(), Duration::from_secs(5))?;
+        clog!("tls", "connecting to {}:{}", dev.ip, dev.port);
+        let t = Instant::now();
+        let mut tcp = TcpStream::connect_timeout(&(dev.ip, dev.port).into(), Duration::from_secs(5))
+            .inspect_err(|e| clog!("tls", "connect failed: {e}"))?;
         tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
         while conn.is_handshaking() {
-            conn.complete_io(&mut tcp)?;
+            conn.complete_io(&mut tcp).inspect_err(|e| clog!("tls", "handshake failed: {e}"))?;
         }
+        clog!("tls", "connected in {} ms, {:?}", t.elapsed().as_millis(), conn.protocol_version());
         // Short from now on, so `recv` returns often enough to check for Stop.
         tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok(Self { tls: rustls::StreamOwned::new(conn, tcp), inbox: vec![], pinged: Instant::now() })
     }
 
     fn send(&mut self, dest: &str, ns: &str, json: &str) -> std::io::Result<()> {
+        if ns != NS_HEARTBEAT {
+            clog!("send", "{dest} {} {json}", short_ns(ns));
+        }
         let msg = cast_message("sender-0", dest, ns, json);
         self.tls.write_all(&(msg.len() as u32).to_be_bytes())?;
         self.tls.write_all(&msg)?;
@@ -395,22 +465,39 @@ impl Channel {
                 && self.inbox.len() >= 4 + len
             {
                 let msg: Vec<u8> = self.inbox.drain(..4 + len).skip(4).collect();
-                let Some((ns, json)) = read_cast_message(&msg) else { continue };
-                if ns == NS_HEARTBEAT && json_str(&json, "type") == Some("PING") {
-                    self.send("receiver-0", NS_HEARTBEAT, r#"{"type":"PONG"}"#)?;
+                let Some((ns, json)) = read_cast_message(&msg) else {
+                    clog!("recv", "unreadable message, {} bytes", msg.len());
+                    continue;
+                };
+                if ns == NS_HEARTBEAT {
+                    if json_str(&json, "type") == Some("PING") {
+                        self.send("receiver-0", NS_HEARTBEAT, r#"{"type":"PONG"}"#)?;
+                    }
                     continue;
                 }
+                clog!("recv", "{} {json}", short_ns(&ns));
                 return Ok(Some((ns, json)));
             }
             let mut buf = [0u8; 4096];
             match self.tls.read(&mut buf) {
-                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                Ok(0) => {
+                    clog!("tls", "the speaker closed the connection");
+                    return Err(ErrorKind::UnexpectedEof.into());
+                }
                 Ok(n) => self.inbox.extend(&buf[..n]),
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(None),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    clog!("tls", "read failed: {e}");
+                    return Err(e);
+                }
             }
         }
     }
+}
+
+/// `urn:x-cast:com.google.cast.media` -> `media`, for the log.
+fn short_ns(ns: &str) -> &str {
+    ns.rsplit('.').next().unwrap_or(ns)
 }
 
 /// Cast devices use self-signed certificates, so there's no chain to check (Google's own
@@ -530,15 +617,32 @@ fn serve(
     let mut samples = vec![0.0f32; 4096 * ich];
     let mut bytes = Vec::with_capacity(4096 * 4);
     let mut heard = Instant::now();
+    // For the log: who is being streamed to, since when, and bytes sent in this second.
+    let (mut peer, mut since, mut sent, mut total, mut tick) = (None, Instant::now(), 0usize, 0usize, Instant::now());
     while !stop.load(Ordering::Relaxed) {
-        if let Ok((c, _)) = listener.accept()
+        if let Ok((c, from)) = listener.accept()
             && let Ok(c) = read_request(c, path)
         {
+            if let Some(old) = peer.filter(|_| conn.is_some()) {
+                clog!("http", "{from} takes the stream over from {old} (after {total} bytes)");
+            }
             // Both before the headers go out: once the client has them, it may already be
             // waiting for audio pushed after them.
             fetched.store(true, Ordering::Relaxed);
             cons.clear(); // start from live audio, not what piled up while waiting
-            conn = send_headers(c, rate).ok();
+            conn = send_headers(c, rate).inspect_err(|e| clog!("http", "headers to {from} failed: {e}")).ok();
+            (peer, since, total) = (Some(from), Instant::now(), 0);
+        }
+        if logging() && tick.elapsed() >= Duration::from_secs(1) {
+            if let Some(p) = peer.filter(|_| conn.is_some()) {
+                let buffered = cons.occupied_len() / ich;
+                clog!(
+                    "http",
+                    "streaming to {p}: {sent} bytes/s, {buffered} frames buffered, {} s",
+                    since.elapsed().as_secs()
+                );
+            }
+            (sent, tick) = (0, Instant::now());
         }
         let n = crate::pop_or_silence(&mut cons, &mut samples, &mut heard, rate, ich, conn.is_some());
         let Some(c) = conn.as_mut().filter(|_| n > 0) else {
@@ -557,10 +661,15 @@ fn serve(
             }
         }
         shared.out_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
-        if c.write_all(&bytes).is_err() {
-            conn = None;
+        match c.write_all(&bytes) {
+            Ok(()) => (sent, total) = (sent + bytes.len(), total + bytes.len()),
+            Err(e) => {
+                clog!("http", "stream to {peer:?} ended after {total} bytes, {} s: {e}", since.elapsed().as_secs());
+                conn = None;
+            }
         }
     }
+    clog!("http", "stream server stopped");
 }
 
 /// Reads the request and accepts it only if it's for `path` (dropping `c` otherwise).
@@ -570,10 +679,18 @@ fn read_request(mut c: TcpStream, path: &str) -> std::io::Result<TcpStream> {
     // A speaker that stops reading would otherwise block the stream thread forever.
     c.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut req = [0u8; 4096];
-    let n = c.read(&mut req)?;
+    let from = c.peer_addr().ok();
+    let n = c.read(&mut req).inspect_err(|e| clog!("http", "request from {from:?} unreadable: {e}"))?;
+    let text = String::from_utf8_lossy(&req[..n]);
     // Request line: "GET <path> HTTP/1.1".
-    let target = std::str::from_utf8(&req[..n]).ok().and_then(|r| r.split(' ').nth(1));
-    if target != Some(path) {
+    let target = text.split(' ').nth(1);
+    let ok = target == Some(path);
+    if logging() {
+        // The request line and headers (User-Agent, Range, ...); the path is a one-time secret.
+        let head = text.trim_end().replace(path, "<path>").replace("\r\n", " | ");
+        clog!("http", "request from {from:?} ({}): {head}", if ok { "accepted" } else { "wrong path, refused" });
+    }
+    if !ok {
         return Err(ErrorKind::NotFound.into());
     }
     Ok(c)
