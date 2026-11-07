@@ -86,3 +86,7 @@ All OS-specific code lives under `src/system/`. `src/system.rs` picks `windows.r
 ## Conventions
 
 Known limitations are marked in code with `// shortcut: <limit>, <when to upgrade>` comments.
+
+Every user-facing change gets a line under `## [Unreleased]` in `CHANGELOG.md`, in the same commit. If it changes the window, update `assets/screenshot.png` as well (recipe in the `release` skill).
+
+To see a change in the real app, use the `run-nymplayer` skill. Its driver launches the app muted with sandboxed settings and clicks widgets through UI Automation. Give new custom-painted widgets an accessible name (`Response::widget_info`) so the driver can reach them; the cast icon is the one left without a name.
