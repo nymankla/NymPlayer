@@ -60,13 +60,11 @@ fn main() -> eframe::Result {
 /// the app being started.
 enum Cmd {
     Show,
-    TogglePlay,
     Quit,
 }
 
 struct Tray {
     icon: TrayIcon,
-    play_item: MenuItem,
     cmds: mpsc::Receiver<Cmd>,
 }
 
@@ -83,18 +81,16 @@ impl Tray {
         };
 
         let show = MenuItem::new("Show NymPlayer", true, None);
-        let play_item = MenuItem::new("Play", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
-        for item in [&show as &dyn tray_icon::menu::IsMenuItem, &play_item, &PredefinedMenuItem::separator(), &quit] {
+        for item in [&show as &dyn tray_icon::menu::IsMenuItem, &PredefinedMenuItem::separator(), &quit] {
             menu.append(item).map_err(|x| e(&x))?;
         }
-        let ids = [show.id().clone(), play_item.id().clone(), quit.id().clone()];
+        let ids = [show.id().clone(), quit.id().clone()];
         let s = send.clone();
         MenuEvent::set_event_handler(Some(move |ev: MenuEvent| match ids.iter().position(|id| *id == ev.id) {
             Some(0) => s(Cmd::Show),
-            Some(1) => s(Cmd::TogglePlay),
-            Some(2) => s(Cmd::Quit),
+            Some(1) => s(Cmd::Quit),
             _ => {}
         }));
         let s = send.clone();
@@ -113,7 +109,7 @@ impl Tray {
             .with_menu_on_left_click(false)
             .build()
             .map_err(|x| e(&x))?;
-        Ok(Self { icon: tray, play_item, cmds })
+        Ok(Self { icon: tray, cmds })
     }
 }
 
@@ -234,7 +230,7 @@ impl App {
             settings: Settings::load(),
             gain: Arc::default(),
             running: None,
-            status: "Stopped".into(),
+            status: "Starting…".into(),
             // Overdue, so the first sync runs right after the first frame.
             last_sync: Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now),
             in_level: 0.0,
@@ -250,14 +246,8 @@ impl App {
         app.update_gain();
         app.show_tray_icon(autostart);
         app.refresh_devices();
-        // Playback resumes (if it was playing when last closed) on the first `logic` pass
-        // after the window is drawn, as opening the streams takes ~250 ms.
-        if app.settings.playing {
-            app.status = "Starting…".into();
-            if let Some(t) = &app.tray {
-                t.play_item.set_text("Stop");
-            }
-        }
+        // NymPlayer always plays; the streams open on the first `logic` pass after the
+        // window is drawn, as opening them takes ~250 ms.
         app
     }
 
@@ -267,18 +257,6 @@ impl App {
         if let Some(t) = &self.tray {
             let _ = t.icon.set_visible(on);
         }
-    }
-
-    fn set_playing(&mut self, on: bool) {
-        if on != self.settings.playing {
-            self.settings.playing = on;
-            self.settings.save();
-        }
-        self.status = "Stopped".into();
-        if let Some(t) = &self.tray {
-            t.play_item.set_text(if on { "Stop" } else { "Play" });
-        }
-        self.sync();
     }
 
     fn update_gain(&self) {
@@ -426,12 +404,14 @@ impl App {
     fn sync(&mut self) {
         self.last_sync = Instant::now();
         self.refresh_devices();
-        // The speaker stopped the cast (or it failed): stop rather than suddenly play locally.
+        // The speaker stopped the cast (or it failed): go back to the local output, and say why.
         if let Some(why) = self.running.as_ref().and_then(|r| r.cast.as_ref()?.ended()) {
             self.cast = None;
-            self.running = None; // before set_playing, whose sync() would see the ended cast again
-            self.set_playing(false);
-            self.status = why;
+            self.running = None; // before sync(), which would see the ended cast again
+            self.sync();
+            if let Some(r) = &self.running {
+                self.status = format!("{why}; playing on {}", r.out_name);
+            }
             return;
         }
         // A write error (e.g. a full disk) stopped the recording; the file is already finished.
@@ -439,10 +419,6 @@ impl App {
             self.recording = None;
             self.running = None;
             self.status = why;
-            return;
-        }
-        if !self.settings.playing && self.recording.is_none() {
-            self.running = None;
             return;
         }
         let s = &self.settings;
@@ -512,7 +488,6 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(V::Minimized(false));
                     ctx.send_viewport_cmd(V::Focus);
                 }
-                Cmd::TogglePlay => self.set_playing(!self.settings.playing),
                 Cmd::Quit => ctx.send_viewport_cmd(V::Close),
             }
         }
@@ -553,7 +528,6 @@ impl eframe::App for App {
 
         let mut changed = false;
         let mut volume_done = false;
-        let mut toggle = false;
         let mut record_toggle = false;
         let mut cast_change = None;
         let live = self.running.is_some();
@@ -601,25 +575,14 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let (label, fill) = if self.settings.playing {
-                    ("⏹  Stop", egui::Color32::from_rgb(70, 70, 80))
-                } else {
-                    ("▶  Play", ACCENT)
-                };
-                let text = egui::RichText::new(label).size(18.0).strong().color(egui::Color32::WHITE);
-                let button = egui::Button::new(text).fill(fill).corner_radius(18).min_size(egui::vec2(120.0, 36.0));
-                // Recording replaces playback, so Play/Stop waits until it's done.
-                toggle = ui.add_enabled(self.recording.is_none(), button).clicked();
                 let tip = if self.recording.is_some() { "Stop recording" } else { "Record the input to a file" };
                 record_toggle = record_button(ui, self.recording.is_some()).on_hover_text(tip).clicked();
                 let dot = if live {
                     GREEN
                 } else if self.status.starts_with("Error") {
                     ACCENT
-                } else if self.settings.playing {
-                    AMBER
                 } else {
-                    egui::Color32::GRAY
+                    AMBER // waiting for a device
                 };
                 let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().circle_filled(r.center(), 5.0, dot);
@@ -648,9 +611,6 @@ impl eframe::App for App {
             }
         });
 
-        if toggle {
-            self.set_playing(!self.settings.playing);
-        }
         if record_toggle {
             match self.recording.take() {
                 Some(t) => {
@@ -664,11 +624,7 @@ impl eframe::App for App {
         }
         if let Some(target) = cast_change {
             self.cast = target;
-            if self.cast.is_some() && !self.settings.playing {
-                self.set_playing(true);
-            } else {
-                self.sync();
-            }
+            self.sync();
         }
 
         if changed || volume_done {
@@ -1181,14 +1137,13 @@ fn meter(peak: f32) -> f32 {
 }
 
 /// Stored as lines in `NymPlayer\settings.txt` under `system::config_dir()` (`%APPDATA%` on Windows): input device ID, output
-/// device ID (empty = Windows default; older files hold names, see `migrate`), volume (0..1), muted (0/1), playing (0/1).
+/// device ID (empty = Windows default; older files hold names, see `migrate`), volume (0..1), muted (0/1), a line that
+/// used to hold "playing" (always written as 1, so older versions keep playing), recording folder and format.
 struct Settings {
     input: String,
     output: String,
     volume: f32,
     muted: bool,
-    /// Playing when last closed; playback resumes on the next start.
-    playing: bool,
     /// Folder and format (file extension) of the last recording, for the save dialog.
     record_dir: String,
     record_format: String,
@@ -1213,8 +1168,8 @@ impl Settings {
             output: lines.next().unwrap_or_default().to_owned(),
             volume: lines.next().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.0, 1.0),
             muted: lines.next() == Some("1"),
-            playing: lines.next() == Some("1"),
-            record_dir: lines.next().unwrap_or_default().to_owned(),
+            // nth(1) skips the unused "playing" line.
+            record_dir: lines.nth(1).unwrap_or_default().to_owned(),
             record_format: lines.next().unwrap_or_default().to_owned(),
         }
     }
@@ -1222,9 +1177,9 @@ impl Settings {
     fn save(&self) {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let (muted, playing) = (self.muted as u8, self.playing as u8);
+            let muted = self.muted as u8;
             let text = format!(
-                "{}\n{}\n{}\n{muted}\n{playing}\n{}\n{}\n",
+                "{}\n{}\n{}\n{muted}\n1\n{}\n{}\n",
                 self.input, self.output, self.volume, self.record_dir, self.record_format
             );
             let _ = std::fs::write(p, text);
@@ -1312,11 +1267,10 @@ mod tests {
         let s = Settings::parse("Mic\nSpeakers\n0.25\n1\n1\nC:\\Music\nflac\n");
         assert_eq!((s.record_dir.as_str(), s.record_format.as_str()), ("C:\\Music", "flac"));
         assert_eq!((s.input.as_str(), s.output.as_str(), s.volume, s.muted), ("Mic", "Speakers", 0.25, true));
-        assert!(s.playing);
         let looped = Settings::parse("loopback:wasapi:{0.0.0.00000000}.{abc}\n");
         assert_eq!(looped.input, PC_SOUND_ID);
         let old = Settings::parse("Mic\n\n");
-        assert_eq!((old.output.as_str(), old.volume, old.muted, old.playing), ("", 1.0, false, false));
+        assert_eq!((old.output.as_str(), old.volume, old.muted), ("", 1.0, false));
     }
 
     #[test]

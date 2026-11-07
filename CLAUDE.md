@@ -2,7 +2,7 @@
 
 ## What it is
 
-NymPlayer is a Rust desktop app, released for Windows only (it builds on macOS and Linux, see Platform code), that passes live audio from an input device (typically a USB audio interface) to a chosen output device (speakers, Bluetooth headphones). The GUI has input/output dropdowns, level meters, volume/mute, and Play/Stop. User-facing description: `readme.md`.
+NymPlayer is a Rust desktop app, released for Windows only (it builds on macOS and Linux, see Platform code), that passes live audio from an input device (typically a USB audio interface) to a chosen output device (speakers, Bluetooth headphones). The GUI has input/output dropdowns, level meters, volume/mute and a record button. There's no Play/Stop: it always plays (mute silences it). User-facing description: `readme.md`.
 
 ## Commands
 
@@ -34,10 +34,10 @@ Audio path, in `start()`:
 - Diagnostics: run with `NYMPLAYER_TRACE=<file>` and `App::trace` appends one line per second (unix time, buffer fill in ms, underruns, dropped input frames, xruns, failed, status), from counters in `Shared`. Counters reset when the streams restart.
 
 Casting (`src/cast.rs`, experimental; details in `.claude/rules/casting.md`), an alternative to the local output device (`enum Output` in `start()`):
-- **Ending:** dropping `Session` stops the stream and the speaker app. If the speaker ends the session, or never fetches the stream within 10 s (usually the firewall), `Session::ended` returns a reason; `sync()` then stops playback rather than switching to the local output.
+- **Ending:** dropping `Session` stops the stream and the speaker app. If the speaker ends the session, or never fetches the stream within 10 s (usually the firewall), `Session::ended` returns a reason; `sync()` then goes back to the local output and puts the reason in the status line.
 
 Device handling, in `App::sync()`:
-- `sync()` runs every second from `App::logic()`, which (unlike `ui()`) still runs while the window is minimized. It also runs on any device or Play/Stop change.
+- `sync()` runs every second from `App::logic()`, which (unlike `ui()`) still runs while the window is minimized. It also runs on any device, cast or recording change.
 - It re-enumerates devices and decides which devices to use: the saved selection if it's present, otherwise the Windows default. An empty selection string means "follow the Windows default".
 - It restarts the streams when that decision changes or when `failed` is set. This is how unplugging, re-plugging and default-device changes are handled.
 
@@ -64,7 +64,7 @@ Tray and window:
 - eframe always makes the window visible after its first frame, so `ViewportBuilder::with_visible(false)` doesn't work. `--tray` instead minimizes the window at startup, and the minimize-to-tray logic then hides it.
 - `src/system/windows.rs` has a registry test, `autostart_round_trip`. It's `#[ignore]`d because it touches the real Run key (and restores it); run it with `cargo test -- --include-ignored`.
 
-Settings (`Settings`) are lines in `NymPlayer/settings.txt` under `system::config_dir()` (`%APPDATA%` on Windows): input device ID, output device ID, volume, muted (0/1), playing (0/1), last recording folder, last recording format (file extension). Playback resumes at startup if `playing` was set. Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
+Settings (`Settings`) are lines in `NymPlayer/settings.txt` under `system::config_dir()` (`%APPDATA%` on Windows): input device ID, output device ID, volume, muted (0/1), an unused line that used to hold "playing" (always written as 1, so older versions keep playing), last recording folder, last recording format (file extension). Missing lines fall back to defaults, so older two-line files still load. They're saved on change; for the volume slider, only when a drag ends.
 
 GUI notes:
 - eframe/egui 0.36 uses `App::ui(&mut self, ui, frame)`, not `update`.

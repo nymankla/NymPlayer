@@ -8,7 +8,7 @@ A small Windows app that plays live audio from an input device, such as a USB au
 
 **[⬇ Download the latest version](https://github.com/nymankla/NymPlayer/releases/latest)**: a single `.exe`, no installer.
 
-<img src="assets/screenshot.png" alt="NymPlayer window: cast icon, input and output dropdowns with level meters, volume slider, Play and record buttons and the Start with Windows option" width="440">
+<img src="assets/screenshot.png" alt="NymPlayer window: cast icon, input and output dropdowns with level meters, volume slider, record button and the Start with Windows option" width="440">
 
 ## Install
 
@@ -25,7 +25,7 @@ Requires 64-bit Windows 11. Windows 10 should also work but hasn't been tested.
 
 1. Plug in your USB audio interface (or other input) and turn on your headphones or speakers.
 2. Choose the **Input** and **Output** devices, or leave either on **Windows default**.
-3. Press **Play**. The level meters show audio coming in and going out.
+3. That's it: NymPlayer plays as soon as it starts. The level meters show audio coming in and going out. Use **Mute** to silence it.
 4. Optional: tick **Start with Windows and keep in the tray** to have NymPlayer start hidden in the system tray when you sign in.
 
 ### Update
@@ -41,15 +41,15 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 ## Features
 
 - **Pick input and output** from the Windows device lists, or choose "Windows default" to follow the system default device.
-- **Play / Stop** to start or stop the audio passthrough.
+- **Always playing.** The audio passes through as soon as the app starts; there's no Play button. Mute silences it.
 - **Level meters** for input and output.
 - **Volume and mute.**
-- **Start with Windows and keep in the tray** (optional). With this on, the app starts hidden in the tray and minimizing hides it there. Click the tray icon to show the window, or right-click for Play/Stop and Quit. Turning it off removes the tray icon and the autostart entry, and the app minimizes normally.
-- **Remembers your settings.** Devices, volume and mute are saved. If the app was playing when you closed it, it starts playing again on the next launch.
+- **Start with Windows and keep in the tray** (optional). With this on, the app starts hidden in the tray and minimizing hides it there. Click the tray icon to show the window, or right-click for Quit. Turning it off removes the tray icon and the autostart entry, and the app minimizes normally.
+- **Remembers your settings.** Devices, volume and mute are saved.
 - **One copy at a time.** Starting NymPlayer again brings the running copy to the front.
 - **Automatic device switching**, also while minimized. If the chosen device is unplugged, playback moves to the Windows default and switches back when the device returns. "Windows default" follows changes to the system default.
 - **High-quality sample-rate conversion.** Input and output can run at different sample rates. The conversion also continuously adjusts for the small speed difference between the two devices' clocks, so audio doesn't click or drift over long sessions.
-- **Record to a file.** The round red button next to Play records the input to a WAV or FLAC file. See [Recording](#recording).
+- **Record to a file.** The round red button records the input to a WAV or FLAC file. See [Recording](#recording).
 - **All PC sound.** The Input list offers *"All PC sound (except NymPlayer)"*: everything other programs play, such as music, videos or games. It's a clean digital copy at full level, unaffected by the Windows volume and sound effects like Dolby. Combine it with casting to send the PC's sound to your Google speakers, or record it. NymPlayer's own sound is left out, so there's no echo. Requires Windows 11; it isn't available on Windows 10.
 - **Cast to Google speakers** (experimental). Click the cast icon at the top right to find Google Home, Nest and Chromecast speakers and speaker groups on your network, and pick one to play there instead of on this PC. See [Casting](#casting-experimental).
 - **Mono and integer input.** Mono input is played on both channels, and 16- or 32-bit integer input is accepted as well as float.
@@ -57,7 +57,7 @@ Quit NymPlayer (right-click the tray icon → **Quit**, or close the window), th
 ## Recording
 
 1. Choose the **Input** to record. This can be your USB interface, a microphone, or *"All PC sound"* to record what the PC plays.
-2. Press the round **record button** next to Play, and choose a file name, folder and type in the save dialog:
+2. Press the round **record button**, and choose a file name, folder and type in the save dialog:
    - **WAV**: uncompressed, opens everywhere.
    - **FLAC**: lossless at about half the size.
 3. While recording, the status shows the elapsed time. **Nothing else plays**: no speakers and no casting, only the file.
@@ -74,7 +74,7 @@ Good to know:
 
 1. Click the **cast icon** at the top right. NymPlayer searches your network for Google Cast speakers (Google Home, Nest Mini, Nest Audio, Nest Hub, Chromecast, speaker groups); they appear within a second or two.
 2. Pick a speaker. The audio now plays there instead of on this PC, and the Output row shows **Casting to …**. Volume and Mute still work.
-3. To go back, open the cast menu and choose **Stop casting**. If the speaker stops on its own (for example "Hey Google, stop"), NymPlayer stops playing.
+3. To go back, open the cast menu and choose **Stop casting**. If the speaker stops on its own (for example "Hey Google, stop"), NymPlayer goes back to playing on this PC.
 
 Things to know:
 
