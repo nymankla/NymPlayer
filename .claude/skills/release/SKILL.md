@@ -38,11 +38,12 @@ user before pushing.**
 - Read the entries back as a user would and make sure each one matches what
   the app now does.
 
-## 3. Refresh the readme screenshot (if the window changed)
+## 3. Update the readme screenshot
 
-`assets/screenshot.png` is the whole window, title bar included, at 879×675.
-Retake it whenever the release changes anything visible. Use the
-`run-nymplayer` driver. It plays "All PC sound", so there's no mic feedback:
+Retake `assets/screenshot.png` for every release, from the build being
+released, so `readme.md` always shows the current window. It's the whole
+window, title bar included, at 879×675. Use the `run-nymplayer` driver. It
+plays "All PC sound", so there's no mic feedback:
 
 ```powershell
 cargo build --release
@@ -53,8 +54,14 @@ powershell -ExecutionPolicy Bypass -File $d quit
 Copy-Item "$env:TEMP\nymplayer-run\readme.png" assets\screenshot.png
 ```
 
-- Look at the image before using it.
-- If the window's layout changed, update the `alt` text in `readme.md`.
+- Look at the image before using it. It should show:
+  - the current controls;
+  - status "Playing: All PC sound…", with the device name cut off;
+  - no personal device names anywhere.
+- Check that the `alt` text of the `<img>` in `readme.md` still lists what's
+  in the window, and update it if not.
+- Check that the readme's text still matches the window: button names, and
+  steps such as "First use".
 
 ## 4. Check locally
 
@@ -67,7 +74,8 @@ cargo build --profile dist   # the published build; note the exe size for the ch
 
 ## 5. Commit
 
-- Commit everything with a subject like `<headline changes>; vX.Y.Z`, as in
+- Commit everything, including `assets/screenshot.png`, in one commit. Use a
+  subject like `<headline changes>; vX.Y.Z`, as in
   `Recording, All PC sound, smaller and leaner; v0.4.0`.
 - In the body, write one bullet per change. Add `Closes #N` for issues it
   fixes.
