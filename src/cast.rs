@@ -19,12 +19,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Debug log of the whole cast flow (search, Cast messages, HTTP requests, stream stats),
-/// appended to the file named by `NYMPLAYER_CAST_LOG`. Nothing is logged without it.
+/// appended to `nymplayer-cast.log` next to the exe (or the file named by `NYMPLAYER_CAST_LOG`).
 static LOG: std::sync::OnceLock<Option<(Instant, Mutex<std::fs::File>)>> = std::sync::OnceLock::new();
 
 fn log_file() -> Option<&'static (Instant, Mutex<std::fs::File>)> {
     LOG.get_or_init(|| {
-        let path = std::env::var_os("NYMPLAYER_CAST_LOG")?;
+        // Temporary, while tracking down speaker groups that only partly play: always on, next
+        // to the exe unless NYMPLAYER_CAST_LOG names a file. Remove once that's solved.
+        let path = match std::env::var_os("NYMPLAYER_CAST_LOG") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::env::current_exe().ok()?.with_file_name("nymplayer-cast.log"),
+        };
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
         let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let _ = writeln!(f, "\n=== NymPlayer {} cast log, unix time {} ===", env!("CARGO_PKG_VERSION"), unix.as_secs());

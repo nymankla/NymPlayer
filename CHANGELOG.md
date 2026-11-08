@@ -4,6 +4,11 @@ All notable changes to NymPlayer are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-08
+
+### Changed
+- The casting debug log is always written, to `nymplayer-cast.log` next to `nymplayer.exe` (temporary, while speaker groups are being fixed).
+
 ## [0.6.0] - 2026-11-07
 
 ### Added
@@ -84,7 +89,8 @@ First release.
 - Only one copy runs at a time; starting it again brings the running copy to the front.
 - Record-player icon.
 
-[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/nymankla/NymPlayer/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/nymankla/NymPlayer/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nymankla/NymPlayer/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nymankla/NymPlayer/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nymankla/NymPlayer/compare/v0.3.0...v0.4.0
